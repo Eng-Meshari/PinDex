@@ -130,8 +130,7 @@ void showProbeStatus(const ProbeStatus &s) {
       drawStatusScreen(kReadyLine, "Probing disabled");
       break;
     case ProbePhase::Scanning:
-      snprintf(line, sizeof line, "Scanning %u/%u", (unsigned)s.scanIndex,
-               (unsigned)PROBE_PERMUTATION_COUNT);
+      snprintf(line, sizeof line, "Scanning %u/%u", (unsigned)s.scanIndex, (unsigned)s.scanTotal);
       drawStatusScreen(line, "Insert Component...");
       break;
     case ProbePhase::Confirming:
@@ -139,7 +138,11 @@ void showProbeStatus(const ProbeStatus &s) {
                        "Confirming...");
       break;
     case ProbePhase::NoComponent:
-      drawStatusScreen("No Component /", "Unknown");
+      if (s.measurementUnavailable) {
+        drawStatusScreen("Measurement", "unavailable");
+      } else {
+        drawStatusScreen("No Component /", "Unknown");
+      }
       break;
     case ProbePhase::Fault:
       drawStatusScreen("Socket rejected", "Send 'r' to retry");

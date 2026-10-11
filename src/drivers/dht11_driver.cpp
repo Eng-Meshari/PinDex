@@ -14,6 +14,8 @@ static_assert(DHT_OPERATION_TIMEOUT_MS > DHT_START_LOW_MS + 7,
 namespace {
 
 const DriverRequirements kRequirements = {
+    ProbeTopology::ThreeWirePowered,   // VCC / DATA / GND
+    ExcitationPolicy::ProtectedActive,  // engine powers VCC/GND
     DHT_POWER_STABILIZE_MS,     // powerStabilizeMs
     DHT_MIN_START_INTERVAL_MS,  // minAcquisitionIntervalMs
     DHT_READ_INTERVAL_MS,       // sampleIntervalMs
@@ -90,16 +92,20 @@ const DriverRequirements &Dht11Driver::getRequirements() const { return kRequire
 
 const char *Dht11Driver::getFailureReason() const { return failureReason_; }
 
-bool Dht11Driver::probe(uint8_t pinVcc, uint8_t pinData, uint8_t pinGnd) {
+bool Dht11Driver::probe(const ProbeContext &context) {
+  if (context.topology != ProbeTopology::ThreeWirePowered) {
+    return fail("topology-mismatch");  // never treat passive terminals as VCC/DATA/GND
+  }
+  const ThreeWirePins &pins = context.powered;
   if (status_ == DriverOperationStatus::Pending) {
-    if (operation_ != Operation::Probe || pinVcc != pinVcc_ || pinData != pinData_ ||
-        pinGnd != pinGnd_) {
+    if (operation_ != Operation::Probe || pins.vcc != pinVcc_ || pins.data != pinData_ ||
+        pins.gnd != pinGnd_) {
       return fail("contract-violation");
     }
   } else {
-    pinVcc_ = pinVcc;
-    pinData_ = pinData;
-    pinGnd_ = pinGnd;
+    pinVcc_ = pins.vcc;
+    pinData_ = pins.data;
+    pinGnd_ = pins.gnd;
     bound_ = false;  // re-earned by this probe
     begin(Operation::Probe);
   }

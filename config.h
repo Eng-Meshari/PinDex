@@ -27,9 +27,11 @@
 // ---------------------------------------------------------------------------
 // Powered probing (Phase 2: DHT11-compatible detection)
 // ---------------------------------------------------------------------------
-// 0 (default): probes stay plain INPUT and the display shows
-// "Probing disabled". 1: run the weak-pull precheck and the six-permutation
-// powered scan, driving probe GPIOs as a nominal 3.3V supply.
+// 0: no probe GPIO is ever driven as VCC/GND (passive weak-pull probing is
+// controlled separately below; both 0 = probes stay plain INPUT and the
+// display shows "Probing disabled"). 1: run the six-permutation powered
+// scan, driving probe GPIOs as a nominal 3.3V supply where the precheck
+// shows no coupling on the VCC node.
 // Setting 1 is a DEPLOYMENT PREREQUISITE, NOT A SAFETY MECHANISM. Only enable
 // it behind a reviewed interface with current limiting, fault handling and
 // protection against wrong polarity and pin assignment (see README).
@@ -38,10 +40,23 @@
 #define PINDEX_POWERED_PROBING_ENABLED 1
 #endif
 
-// Weak-pull precheck (diagnostic heuristic, not a safety test).
+// Passive weak-pull probing (Phase 3.2, src/drivers/passive_driver.cpp).
+// Independent of PINDEX_POWERED_PROBING_ENABLED: one node's internal pull-up
+// is sensed by the ADC while another node sinks LOW through an open-drain
+// output; no probe node is ever driven HIGH. With BOTH flags 0 every probe
+// stays plain INPUT (global disable). Connect only UNPOWERED parts: the LOW
+// sink is not protected against an external voltage source.
+#ifndef PINDEX_PASSIVE_PROBING_ENABLED
+#define PINDEX_PASSIVE_PROBING_ENABLED 1
+#endif
+
+// Weak-pull precheck (diagnostic heuristic, not a safety test). It routes:
+// a pulled-down node reading HIGH marks that pair as coupled, which blocks
+// powered drive across it; inconsistent readings are retried, then "unknown".
 #define PRECHECK_SETTLE_MS 5UL           // after changing pulls, before sample 1
 #define PRECHECK_SAMPLE_INTERVAL_MS 2UL  // between samples
 #define PRECHECK_SAMPLES 4               // per pull-up source node
+#define PRECHECK_MAX_RETRIES 2           // extra passes after inconsistent readings
 
 // Engine power policy (driver-independent). Stabilization and acquisition
 // spacing come from each driver's DriverRequirements.
@@ -72,3 +87,36 @@
 #define DHT11_HUMIDITY_MAX_PCT 95
 #define DHT11_TEMPERATURE_MIN_C 0
 #define DHT11_TEMPERATURE_MAX_C 50
+
+// Passive driver: timing.
+#define PASSIVE_SAMPLE_PERIOD_MS 100UL       // monitoring cadence, start to start
+#define PASSIVE_OPERATION_TIMEOUT_MS 1000UL  // engine abandons a still-pending measurement
+#define PASSIVE_SETTLE_MS 5UL                // after any excitation change
+#define PASSIVE_SAMPLE_INTERVAL_MS 2UL       // between ADC samples in one window
+#define PASSIVE_REFERENCE_SAMPLES 2          // pull-up check with the sink released
+#define PASSIVE_WINDOW_SAMPLES 4             // divider samples per orientation
+
+// Passive driver: divider model. Approximate by design: the internal
+// pull-up is only nominally 45 kOhm (wide part-to-part and temperature
+// spread) and the rail is nominally 3.3 V.
+#define PASSIVE_SUPPLY_MV 3300               // rail feeding the pull-up (nominal)
+#define PASSIVE_PULLUP_NOMINAL_OHMS 45000UL  // NOT a precision reference
+#define PASSIVE_ADC_DEFAULT_VREF_MV 1100     // line-fitting calibration if eFuse Vref is absent
+#define PASSIVE_ADC_UNCAL_FULL_SCALE_MV 3100 // raw 4095 if no calibration scheme is available
+#define PASSIVE_PULLUP_VERIFY_MIN_MV 2450    // sink released: the pull-up must lift the node here
+#define PASSIVE_CONTACT_MAX_MV 150           // at/below: Contact / Low R (useful-range floor)
+#define PASSIVE_OPEN_MIN_MV 2450             // at/above: open-like / very high R (useful-range top)
+
+// Passive driver: classification.
+#define PASSIVE_STABLE_SPREAD_MV 80          // max spread inside one probe window
+#define PASSIVE_SYMMETRY_MIN_DELTA_MV 60     // orientations may differ by this much...
+#define PASSIVE_SYMMETRY_PCT 15              // ...or by this % of their mean
+#define PASSIVE_DEBOUNCE_SAMPLES 2           // consecutive samples to accept OPEN/CLOSED
+#define PASSIVE_OPEN_GRACE_SAMPLES 50        // resistive part open-like this long -> failure
+#define PASSIVE_FILTER_SHIFT 2               // exponential filter weight 1/4
+#define PASSIVE_VARIATION_MIN_MV 150         // filtered change counted as variation...
+#define PASSIVE_VARIATION_CONFIRM_SAMPLES 5  // ...for this many consecutive samples
+#define PASSIVE_LDR_WINDOW_SAMPLES 10        // guided dark/bright reference window
+#define PASSIVE_LDR_MAX_WINDOW_SPREAD_MV 120 // each reference window must be this steady
+#define PASSIVE_LDR_MIN_SEPARATION_MV 300    // dark minus bright needed to accept
+#define PASSIVE_MESSAGE_SAMPLES 30           // samples a calibration message stays shown

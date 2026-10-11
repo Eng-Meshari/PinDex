@@ -17,6 +17,7 @@
 #define INPUT_PULLDOWN 0x09
 #define OPEN_DRAIN 0x10
 #define OUTPUT_OPEN_DRAIN 0x13
+#define ANALOG 0xC0  // used by the simulated ADC adapter to mark a sensed pad
 
 namespace mock {
 

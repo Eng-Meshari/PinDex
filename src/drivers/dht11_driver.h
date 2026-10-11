@@ -8,7 +8,7 @@
 class Dht11Driver final : public SensorDriver {
  public:
   const char *getName() const override;
-  bool probe(uint8_t pinVcc, uint8_t pinData, uint8_t pinGnd) override;
+  bool probe(const ProbeContext &context) override;
   bool readSample(char *outLine1, char *outLine2, size_t maxLen) override;
   void reset() override;
   DriverOperationStatus getOperationStatus() const override;

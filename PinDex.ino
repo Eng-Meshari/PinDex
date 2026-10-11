@@ -1,8 +1,9 @@
 // PinDex - Smart Component & Sensor Identifier
-// Sensor drivers (src/drivers/) behind a generic probe engine; currently a
-// DHT11-compatible driver with A/B/C pinout and live telemetry.
-// Powered probing is controlled by PINDEX_POWERED_PROBING_ENABLED in
-// config.h; read the README before enabling it.
+// Sensor drivers (src/drivers/) behind a generic probe engine: a
+// DHT11-compatible powered driver and a weak-pull passive/switch driver.
+// Powered and passive probing are controlled separately in config.h
+// (PINDEX_POWERED_PROBING_ENABLED, PINDEX_PASSIVE_PROBING_ENABLED); read
+// the README before enabling either.
 
 #include "config.h"
 #include "display_manager.h"
@@ -19,7 +20,11 @@ static uint32_t loggedRevision = 0;
 static void logProbeStatus(const ProbeStatus &s) {
   Serial.printf("probe: %s", probePhaseName(s.phase));
   if (s.phase == ProbePhase::Scanning) {
-    Serial.printf(" %u/%u", (unsigned)s.scanIndex, (unsigned)PROBE_PERMUTATION_COUNT);
+    Serial.printf(" %u/%u", (unsigned)s.scanIndex, (unsigned)s.scanTotal);
+  }
+  if (s.precheck == PrecheckResult::CouplingObserved) {
+    Serial.printf(" coupled=%s%s%s", (s.coupledPairs & 1) ? "AB " : "",
+                  (s.coupledPairs & 2) ? "BC " : "", (s.coupledPairs & 4) ? "AC" : "");
   }
   if (s.componentName != nullptr) Serial.printf(" %s", s.componentName);
   if (s.hasMapping) {
@@ -34,6 +39,7 @@ static void logProbeStatus(const ProbeStatus &s) {
   }
   if (s.consecutiveFailures > 0) Serial.printf(" fails=%u", (unsigned)s.consecutiveFailures);
   if (s.lastError != nullptr) Serial.printf(" err=%s", s.lastError);
+  if (s.measurementUnavailable) Serial.print(" measurement-unavailable");
   if (s.phase == ProbePhase::Fault) {
     Serial.printf(" precheck=%s; send 'r' to retry", precheckResultName(s.precheck));
   }
@@ -41,12 +47,23 @@ static void logProbeStatus(const ProbeStatus &s) {
 }
 
 // Non-blocking: handles only bytes that have already arrived.
+//   r  retry after a latched fault
+//   c  clear the result and rescan (e.g. a switch left OPEN: an open switch
+//      cannot be told apart from removal)
+//   other letters go to the detected driver (passive: l = guided LDR
+//   calibration start/cancel, d = take dark reference, b = take bright)
 static void handleSerialCommands() {
   while (Serial.available() > 0) {
     const int c = Serial.read();
     if (c == 'r' || c == 'R') {
       Serial.println(probeRequestRetry() ? "retry: fault cleared, rerunning precheck"
                                          : "retry: ignored (no latched fault, or probing disabled)");
+    } else if (c == 'c' || c == 'C') {
+      Serial.println(probeRequestClear() ? "clear: result cleared, rescanning"
+                                         : "clear: ignored (probing disabled)");
+    } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+      Serial.printf("command '%c': %s\n", c,
+                    probeSendCommand(static_cast<char>(c)) ? "accepted" : "ignored");
     }
   }
 }
@@ -62,7 +79,11 @@ void setup() {
   Serial.println();
   Serial.println(PINDEX_POWERED_PROBING_ENABLED
                      ? "Powered probing ENABLED: requires the protected interface (README)."
-                     : "Powered probing disabled: probes stay high impedance.");
+                     : "Powered probing disabled: no probe is driven as VCC/GND.");
+  Serial.println(PINDEX_PASSIVE_PROBING_ENABLED
+                     ? "Passive probing ENABLED: weak pull-up + open-drain sink; unpowered parts only."
+                     : "Passive probing disabled.");
+  Serial.println("Serial: r=retry fault, c=clear/rescan, l/d/b=guided LDR calibration.");
 
   displayOk = initDisplay();
   if (displayOk) {
