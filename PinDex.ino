@@ -1,11 +1,13 @@
 // PinDex - Smart Component & Sensor Identifier
-// v0.2: DHT11-compatible detection, A/B/C pinout and live temperature/humidity.
-// Powered probing is compiled in but OFF by default
-// (PINDEX_POWERED_PROBING_ENABLED in config.h); see README before enabling.
+// Sensor drivers (src/drivers/) behind a generic probe engine; currently a
+// DHT11-compatible driver with A/B/C pinout and live telemetry.
+// Powered probing is controlled by PINDEX_POWERED_PROBING_ENABLED in
+// config.h; read the README before enabling it.
 
 #include "config.h"
 #include "display_manager.h"
 #include "probe_engine.h"
+#include "src/drivers/driver_registry.h"
 
 static bool displayOk = false;
 static bool splashPending = false;  // true until the probe screens take over
@@ -19,17 +21,19 @@ static void logProbeStatus(const ProbeStatus &s) {
   if (s.phase == ProbePhase::Scanning) {
     Serial.printf(" %u/%u", (unsigned)s.scanIndex, (unsigned)PROBE_PERMUTATION_COUNT);
   }
+  if (s.componentName != nullptr) Serial.printf(" %s", s.componentName);
   if (s.hasMapping) {
     char mapping[PROBE_MAPPING_TEXT_LEN];
     formatProbeMapping(s.mapping, mapping, sizeof mapping);
     Serial.printf(" [%s]", mapping);
   }
   if (s.readingValid) {
-    Serial.printf(" T=%d.%dC H=%u%%%s", s.temperatureDeciC / 10, s.temperatureDeciC % 10,
-                  (unsigned)s.humidityPct, s.readingStale ? " STALE" : "");
+    Serial.printf(" \"%s\"", s.telemetry1);
+    if (s.telemetry2[0] != '\0') Serial.printf(" \"%s\"", s.telemetry2);
+    if (s.readingStale) Serial.print(" STALE");
   }
   if (s.consecutiveFailures > 0) Serial.printf(" fails=%u", (unsigned)s.consecutiveFailures);
-  if (s.lastError != DhtError::None) Serial.printf(" err=%s", dhtErrorName(s.lastError));
+  if (s.lastError != nullptr) Serial.printf(" err=%s", s.lastError);
   if (s.phase == ProbePhase::Fault) {
     Serial.printf(" precheck=%s; send 'r' to retry", precheckResultName(s.precheck));
   }
@@ -51,7 +55,11 @@ void setup() {
   initProbeEngine();  // First hardware action: probes to high impedance.
 
   Serial.begin(SERIAL_BAUD_RATE);
-  Serial.println("PinDex v" PINDEX_VERSION " - DHT11-compatible probe mode.");
+  Serial.print("PinDex v" PINDEX_VERSION " - drivers:");
+  for (size_t i = 0; i < sensorDriverCount(); i++) {
+    Serial.printf(" [%s]", sensorDriverAt(i)->getName());
+  }
+  Serial.println();
   Serial.println(PINDEX_POWERED_PROBING_ENABLED
                      ? "Powered probing ENABLED: requires the protected interface (README)."
                      : "Powered probing disabled: probes stay high impedance.");

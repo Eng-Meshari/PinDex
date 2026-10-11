@@ -14,7 +14,8 @@ void showSplashScreen();
 // Draws the idle "Ready / Insert Component..." screen once.
 void showIdleScreen();
 
-// Draws the screen for the current probe status: idle, scanning, fault,
-// "No Component / Unknown", or the DHT11 result (marked STALE on retries).
-// Call only when status.revision changes; never during a capture.
+// Draws the screen for the current probe status snapshot: idle, scanning,
+// fault, "No Component / Unknown", or the detected component (driver name,
+// driver telemetry, mapping; marked STALE on retries). Rendering never
+// triggers an acquisition. Call only when status.revision changes.
 void showProbeStatus(const ProbeStatus &status);

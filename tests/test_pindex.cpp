@@ -1,12 +1,14 @@
-// Host tests for PinDex Phase 2 logic. Not part of the Arduino build: the
-// IDE compiles only the sketch folder root (and src/), never tests/.
+// Host tests for PinDex. Not part of the Arduino build: the IDE compiles
+// only the sketch folder root and src/, never tests/.
 // From the PinDex folder, with any C++17 host compiler:
 //   g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1
-//       tests/test_pindex.cpp probe_engine.cpp dht11.cpp -o build/test_enabled
-//   g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=0
-//       tests/test_pindex.cpp probe_engine.cpp dht11.cpp -o build/test_disabled
-// Run both; each exits non-zero if any check fails. Shorts, faults and the
-// sensor are simulated; nothing here touches hardware.
+//       tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp
+//       -o build/test_enabled
+//   (repeat with -DPINDEX_POWERED_PROBING_ENABLED=0 -o build/test_disabled)
+// Run both; each exits non-zero if any check fails. This file supplies the
+// driver registry itself (link seam), so tests can register the real
+// Dht11Driver or fake drivers. Shorts, faults and sensors are simulated;
+// nothing here touches hardware.
 
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +18,9 @@
 #include "config.h"
 #include "dht11.h"
 #include "probe_engine.h"
+#include "sensor_driver.h"
+#include "src/drivers/dht11_driver.h"
+#include "src/drivers/driver_registry.h"
 
 static int checks = 0;
 static int failures = 0;
@@ -27,6 +32,27 @@ static int failures = 0;
       printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);  \
     }                                                         \
   } while (0)
+
+[[maybe_unused]] static bool same(const char *a, const char *b) {
+  return a != nullptr && b != nullptr && strcmp(a, b) == 0;
+}
+
+// ---- Test registry (replaces src/drivers/driver_registry.cpp) --------------
+
+static SensorDriver *testDrivers[4] = {};
+static size_t testDriverCount = 0;
+
+size_t sensorDriverCount() { return testDriverCount; }
+
+SensorDriver *sensorDriverAt(size_t index) {
+  return index < testDriverCount ? testDrivers[index] : nullptr;
+}
+
+static void useDrivers(SensorDriver *first = nullptr, SensorDriver *second = nullptr) {
+  testDriverCount = 0;
+  if (first != nullptr) testDrivers[testDriverCount++] = first;
+  if (second != nullptr) testDrivers[testDriverCount++] = second;
+}
 
 // ---- Pure decoding ---------------------------------------------------------
 
@@ -151,6 +177,16 @@ static bool allProbesPlainInput() {
   return true;
 }
 
+static int permutationOf(uint8_t vcc, uint8_t data, uint8_t gnd) {
+  for (int i = 0; i < PROBE_PERMUTATION_COUNT; i++) {
+    const ProbeMapping &m = PROBE_PERMUTATIONS[i];
+    if (kProbeGpio[m.vcc] == vcc && kProbeGpio[m.data] == data && kProbeGpio[m.gnd] == gnd) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 // One loop() iteration per simulated millisecond.
 static void tick() {
   mock::nowUs += 1000;
@@ -167,6 +203,113 @@ static bool runUntil(Done done, uint32_t maxMs) {
   for (uint32_t i = 0; i < maxMs && !done(); i++) tick();
   return done();
 }
+
+static ProbePhase phase() { return probeStatus().phase; }
+
+// ---- Fake driver: proves the engine is driver-agnostic ---------------------
+
+struct Attempt {
+  int driver;
+  int perm;
+  bool sample;  // false = probe()
+  uint64_t us;
+};
+static Attempt attempts[256];
+static int attemptCount = 0;
+
+class FakeDriver final : public SensorDriver {
+ public:
+  FakeDriver(int id, const char *name) : id_(id), name_(name) {}
+
+  DriverRequirements req = {300, 500, 700, 1000};
+  int pendingCalls = 0;  // Pending results before each operation completes
+  int acceptPerm = -1;   // probe() succeeds only on this permutation index
+  bool samplesSucceed = true;
+
+  int probeStarts = 0;
+  int sampleStarts = 0;
+  int calls = 0;
+  int resets = 0;
+  int unsafeResets = 0;     // reset() while a probe pin was not plain INPUT
+  int unpoweredStarts = 0;  // operation started without the engine powering VCC/GND
+
+  const char *getName() const override { return name_; }
+  DriverOperationStatus getOperationStatus() const override { return status_; }
+  const DriverRequirements &getRequirements() const override { return req; }
+  const char *getFailureReason() const override {
+    return status_ == DriverOperationStatus::Failed ? "fake-failed" : "";
+  }
+
+  bool probe(uint8_t pinVcc, uint8_t pinData, uint8_t pinGnd) override {
+    calls++;
+    if (status_ != DriverOperationStatus::Pending) {
+      probeStarts++;
+      perm_ = permutationOf(pinVcc, pinData, pinGnd);
+      bound_ = false;
+      start(false, pinVcc, pinGnd);
+    }
+    if (remaining_ > 0) {
+      remaining_--;
+      return false;
+    }
+    bound_ = perm_ == acceptPerm;
+    status_ = bound_ ? DriverOperationStatus::Succeeded : DriverOperationStatus::Failed;
+    return bound_;
+  }
+
+  bool readSample(char *line1, char *line2, size_t maxLen) override {
+    calls++;
+    if (line1 == nullptr || line2 == nullptr || maxLen == 0) {
+      status_ = DriverOperationStatus::Failed;
+      return false;
+    }
+    line1[0] = line2[0] = '\0';
+    if (status_ != DriverOperationStatus::Pending) {
+      if (!bound_) {
+        status_ = DriverOperationStatus::Failed;
+        return false;
+      }
+      sampleStarts++;
+      start(true, vccPin_, gndPin_);
+    }
+    if (remaining_ > 0) {
+      remaining_--;
+      return false;
+    }
+    status_ = samplesSucceed ? DriverOperationStatus::Succeeded : DriverOperationStatus::Failed;
+    if (!samplesSucceed) return false;
+    snprintf(line1, maxLen, "%s #%d", name_, sampleStarts);
+    snprintf(line2, maxLen, "second line");
+    return true;
+  }
+
+  void reset() override {
+    resets++;
+    if (!allProbesPlainInput()) unsafeResets++;
+    status_ = DriverOperationStatus::Idle;
+    bound_ = false;
+    remaining_ = 0;
+  }
+
+ private:
+  void start(bool sample, uint8_t vcc, uint8_t gnd) {
+    vccPin_ = vcc;
+    gndPin_ = gnd;
+    status_ = DriverOperationStatus::Pending;
+    remaining_ = pendingCalls;
+    if (!(mock::drivesHigh(vcc) && mock::drivesLow(gnd))) unpoweredStarts++;
+    if (attemptCount < 256) attempts[attemptCount++] = Attempt{id_, perm_, sample, mock::nowUs};
+  }
+
+  int id_;
+  const char *name_;
+  DriverOperationStatus status_ = DriverOperationStatus::Idle;
+  bool bound_ = false;
+  int remaining_ = 0;
+  int perm_ = -1;
+  uint8_t vccPin_ = 0;
+  uint8_t gndPin_ = 0;
+};
 
 #if PINDEX_POWERED_PROBING_ENABLED
 
@@ -196,6 +339,7 @@ struct SimSensor {
   uint8_t segLevel[2 * DHT_FRAME_BITS + 4] = {};
 };
 
+static Dht11Driver dht;  // the production driver, registered per test
 static SimSensor sensor;
 static bool shortAB = false;  // A and B behave as one node
 static bool flakyA = false;   // A alternates HIGH/LOW while pulled up
@@ -275,22 +419,29 @@ static int readHook(uint8_t pin) {
   return -1;
 }
 
+// Call useDrivers() first: init resets every registered driver.
 static void resetWorld(uint64_t startUs = 1000000ULL) {
   mock::reset(startUs);
   sensor = SimSensor();
   shortAB = false;
   flakyA = false;
   flakyReads = 0;
+  attemptCount = 0;
   mock::readHook = readHook;
   mock::changeHook = onPinChange;
   initProbeEngine();
 }
 
+static void resetWithDht(uint64_t startUs = 1000000ULL) {
+  useDrivers(&dht);
+  resetWorld(startUs);
+}
+
 static bool detectWith(int wiring) {
-  resetWorld();
+  resetWithDht();
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[wiring];
-  return runUntil([] { return probeStatus().phase == ProbePhase::Detected; }, 20000);
+  return runUntil([] { return phase() == ProbePhase::Detected; }, 20000);
 }
 
 // ---- Event-log replay: one Session per powered interval --------------------
@@ -300,7 +451,7 @@ struct Session {
   uint64_t endUs = UINT64_MAX;  // UINT64_MAX = still powered
   int vcc = -1;
   int gnd = -1;
-  int data = -1;
+  int data = -1;  // known only for drivers that pull DATA low (DHT)
   int starts = 0;
   uint64_t firstStartUs = 0;
 };
@@ -368,7 +519,7 @@ static SessionLog collectSessions() {
       if (highNode >= 0) cur.vcc = highNode;
       if (ppLowNode >= 0) cur.gnd = ppLowNode;
       if (odNode >= 0) cur.data = odNode;
-      if (odNode == n && !odBefore) {  // a new start request
+      if (odNode == n && !odBefore) {  // a new DHT start request
         if (cur.starts++ == 0) cur.firstStartUs = e.us;
         if (log.startCount < 256) log.startTimes[log.startCount++] = e.us;
       }
@@ -387,20 +538,25 @@ static bool sessionUses(const Session &s, const ProbeMapping &m) {
   return s.vcc == m.vcc && s.gnd == m.gnd && s.data == m.data;
 }
 
-// ---- Powered-path tests ----------------------------------------------------
+static bool sessionPowers(const Session &s, const ProbeMapping &m) {
+  return s.vcc == m.vcc && s.gnd == m.gnd;
+}
+
+// ---- DHT11 through the engine (Phase 2 behaviour, preserved) ---------------
 
 static void testEmptySocketScan() {
-  resetWorld();
+  resetWithDht();
   const uint64_t t0 = mock::nowUs;
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::NoComponent; }, 20000));
-  CHECK(probeStatus().lastError == DhtError::NoResponse);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 20000));
+  CHECK(same(probeStatus().lastError, dhtErrorName(DhtError::NoResponse)));
   CHECK(probeStatus().precheck == PrecheckResult::NoObviousCoupling);
   CHECK(!probeStatus().hasMapping && !probeStatus().readingValid);
+  CHECK(probeStatus().componentName == nullptr);
   CHECK(allProbesPlainInput());
 
   // Latency is dominated by per-permutation stabilization (~1.46 s each).
   const uint64_t scanMs = (mock::nowUs - t0) / 1000;
-  CHECK(scanMs >= 6 * PROBE_POWER_STABILIZE_MS && scanMs <= 6 * 1600);
+  CHECK(scanMs >= 6 * DHT_POWER_STABILIZE_MS && scanMs <= 6 * 1600);
 
   const SessionLog log = collectSessions();
   CHECK(log.violations == 0);
@@ -409,7 +565,7 @@ static void testEmptySocketScan() {
     const Session &x = log.s[i];
     CHECK(sessionUses(x, PROBE_PERMUTATIONS[i]));  // exact table order
     CHECK(x.endUs != UINT64_MAX && x.starts == 1);
-    CHECK(x.firstStartUs - x.startUs >= (PROBE_POWER_STABILIZE_MS - 1) * 1000);
+    CHECK(x.firstStartUs - x.startUs >= (DHT_POWER_STABILIZE_MS - 1) * 1000);
     if (i > 0) {  // torn down, then the power-off interval, before the next one
       CHECK(x.startUs - log.s[i - 1].endUs >= (PROBE_POWER_OFF_MS - 1) * 1000);
     }
@@ -417,25 +573,28 @@ static void testEmptySocketScan() {
 
   // Probes stay INPUT for the rescan interval, then discovery restarts.
   runMs(PROBE_RESCAN_INTERVAL_MS - 50);
-  CHECK(probeStatus().phase == ProbePhase::NoComponent);
+  CHECK(phase() == ProbePhase::NoComponent);
   CHECK(collectSessions().count == PROBE_PERMUTATION_COUNT);
   runMs(100);
-  CHECK(probeStatus().phase == ProbePhase::Scanning && probeStatus().scanIndex == 1);
+  CHECK(phase() == ProbePhase::Scanning && probeStatus().scanIndex == 1);
 }
 
 static void testDetectionNeedsTwoFrames() {
-  resetWorld();
+  resetWithDht();
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[3];  // B = VCC, C = DATA, A = GND
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Confirming; }, 20000));
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 20000));
   CHECK(sensor.responses == 1);
   CHECK(probeStatus().hasMapping && !probeStatus().detected);
+  CHECK(!probeStatus().readingValid);  // probe() proves identity; telemetry comes from samples
+  CHECK(same(probeStatus().componentName, "DHT11 Temp & Hum"));
 
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Detected; }, 3000));
-  CHECK(sensor.responses == 2);
-  CHECK(probeStatus().temperatureDeciC == 250 && probeStatus().humidityPct == 60);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 3000));
+  CHECK(sensor.responses == 2);  // two genuine frames
+  CHECK(same(probeStatus().telemetry1, "T: 25*C  |  H: 60%"));
+  CHECK(probeStatus().telemetry2[0] == '\0');
   CHECK(!probeStatus().readingStale && probeStatus().consecutiveFailures == 0);
-  CHECK(probeStatus().lastError == DhtError::None);
+  CHECK(probeStatus().lastError == nullptr);
   char text[PROBE_MAPPING_TEXT_LEN];
   formatProbeMapping(probeStatus().mapping, text, sizeof text);
   CHECK(strcmp(text, "A:GND | B:VCC | C:DAT") == 0);
@@ -455,7 +614,7 @@ static void testDetectionNeedsTwoFrames() {
   const uint32_t lastMs = probeStatus().lastReadingMs;
   const uint32_t rev = probeStatus().revision;
   runMs(DHT_READ_INTERVAL_MS + 100);
-  CHECK(probeStatus().humidityPct == 61 && probeStatus().temperatureDeciC == 260);
+  CHECK(same(probeStatus().telemetry1, "T: 26*C  |  H: 61%"));
   CHECK(probeStatus().lastReadingMs - lastMs >= DHT_READ_INTERVAL_MS - 50);
   CHECK(probeStatus().revision != rev);
   log = collectSessions();
@@ -465,31 +624,36 @@ static void testDetectionNeedsTwoFrames() {
   const uint32_t quietRev = probeStatus().revision;
   runMs(2 * DHT_READ_INTERVAL_MS);
   CHECK(probeStatus().revision == quietRev);
-  CHECK(probeStatus().phase == ProbePhase::Detected);
+  CHECK(phase() == ProbePhase::Detected);
 }
 
 static void testStaleThenRecovery() {
   CHECK(detectWith(3));
   sensor.respond = false;  // e.g. a bad contact for one read
   CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 3000));
-  CHECK(probeStatus().phase == ProbePhase::Retrying);
+  CHECK(phase() == ProbePhase::Retrying);
   CHECK(probeStatus().readingStale && probeStatus().readingValid && probeStatus().detected);
-  CHECK(probeStatus().temperatureDeciC == 250);  // old value kept, marked stale
-  CHECK(probeStatus().lastError == DhtError::NoResponse);
+  CHECK(same(probeStatus().telemetry1, "T: 25*C  |  H: 60%"));  // kept, marked stale
+  CHECK(same(probeStatus().lastError, dhtErrorName(DhtError::NoResponse)));
   CHECK(allProbesPlainInput());  // torn down at once
 
+  // The retry re-probes the saved driver; that proves the link but is not
+  // a published sample, so the telemetry stays stale until the next one.
   sensor.respond = true;
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Detected; }, 5000));
-  CHECK(!probeStatus().readingStale && probeStatus().consecutiveFailures == 0);
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 0; }, 3000));
+  CHECK(phase() == ProbePhase::Retrying && probeStatus().readingStale);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 3000));
+  CHECK(!probeStatus().readingStale);
 
   // The retry powers only the saved mapping, after cooldown, precheck and a
-  // fresh stabilization, and start requests keep their minimum spacing.
+  // fresh stabilization, and acquisition starts keep their minimum spacing.
   const SessionLog log = collectSessions();
   CHECK(log.violations == 0);
   CHECK(log.count == 5);
   CHECK(sessionUses(log.s[4], PROBE_PERMUTATIONS[3]));
+  CHECK(log.s[4].starts == 2);  // re-probe, then a new sample
   CHECK(log.s[4].startUs - log.s[3].endUs >= (PROBE_RETRY_COOLDOWN_MS - 1) * 1000);
-  CHECK(log.s[4].firstStartUs - log.s[4].startUs >= (PROBE_POWER_STABILIZE_MS - 1) * 1000);
+  CHECK(log.s[4].firstStartUs - log.s[4].startUs >= (DHT_POWER_STABILIZE_MS - 1) * 1000);
   for (int i = 1; i < log.startCount; i++) {
     if (log.startTimes[i - 1] >= log.s[3].startUs) {
       CHECK(log.startTimes[i] - log.startTimes[i - 1] >= (DHT_MIN_START_INTERVAL_MS - 1) * 1000);
@@ -504,12 +668,13 @@ static void testRemovalAfterThreeFailures() {
   const uint64_t removedUs = mock::nowUs;
 
   CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 3000));
-  CHECK(probeStatus().phase == ProbePhase::Retrying && probeStatus().readingStale);
+  CHECK(phase() == ProbePhase::Retrying && probeStatus().readingStale);
   CHECK(runUntil([] { return probeStatus().consecutiveFailures == 2; }, 4000));
   CHECK(probeStatus().hasMapping);
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Idle; }, 4000));
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 4000));
   CHECK(!probeStatus().hasMapping && !probeStatus().detected);
   CHECK(!probeStatus().readingValid && !probeStatus().readingStale);
+  CHECK(probeStatus().componentName == nullptr && probeStatus().telemetry1[0] == '\0');
   CHECK(allProbesPlainInput());
   CHECK((mock::nowUs - removedUs) / 1000 <= DHT_READ_INTERVAL_MS + 2 * 2300);
 
@@ -522,16 +687,16 @@ static void testRemovalAfterThreeFailures() {
 
   // Discovery resumes only after the rescan interval.
   runMs(PROBE_RESCAN_INTERVAL_MS - 50);
-  CHECK(probeStatus().phase == ProbePhase::Idle);
+  CHECK(phase() == ProbePhase::Idle);
   CHECK(collectSessions().count == log.count);
   runMs(100);
-  CHECK(probeStatus().phase == ProbePhase::Scanning && probeStatus().scanIndex == 1);
+  CHECK(phase() == ProbePhase::Scanning && probeStatus().scanIndex == 1);
 }
 
 // Runs permutation 1 against a misbehaving sensor wired as permutation 1 and
-// returns the error that rejected it.
-static DhtError firstAttemptError(void (*configure)()) {
-  resetWorld();
+// returns the reason that rejected it.
+static const char *firstAttemptError(void (*configure)()) {
+  resetWithDht();
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[0];
   configure();
@@ -543,55 +708,59 @@ static DhtError firstAttemptError(void (*configure)()) {
 }
 
 static void testCaptureErrors() {
-  CHECK(firstAttemptError([] { sensor.stuckLow = true; }) == DhtError::StuckLow);
-  CHECK(firstAttemptError([] { sensor.respond = false; }) == DhtError::NoResponse);  // stuck high
-  CHECK(firstAttemptError([] { sensor.ackLowUs = 20; }) == DhtError::BadAckTiming);
-  CHECK(firstAttemptError([] { sensor.ackLowUs = 200; }) == DhtError::AckTimeout);
-  CHECK(firstAttemptError([] { sensor.bitsSent = 20; }) == DhtError::BitTimeout);  // truncated
-  CHECK(firstAttemptError([] { sensor.oneHighUs = 110; }) == DhtError::BadBitTiming);
-  CHECK(firstAttemptError([] { sensor.frame[4] ^= 1; }) == DhtError::Checksum);
-  CHECK(firstAttemptError([] {
-          const uint8_t f[5] = {60, 5, 25, 0, 90};
-          memcpy(sensor.frame, f, 5);
-        }) == DhtError::UnsupportedEncoding);
+  CHECK(same(firstAttemptError([] { sensor.stuckLow = true; }), dhtErrorName(DhtError::StuckLow)));
+  CHECK(same(firstAttemptError([] { sensor.respond = false; }),  // stuck high
+             dhtErrorName(DhtError::NoResponse)));
+  CHECK(same(firstAttemptError([] { sensor.ackLowUs = 20; }), dhtErrorName(DhtError::BadAckTiming)));
+  CHECK(same(firstAttemptError([] { sensor.ackLowUs = 200; }), dhtErrorName(DhtError::AckTimeout)));
+  CHECK(same(firstAttemptError([] { sensor.bitsSent = 20; }),  // truncated
+             dhtErrorName(DhtError::BitTimeout)));
+  CHECK(same(firstAttemptError([] { sensor.oneHighUs = 110; }), dhtErrorName(DhtError::BadBitTiming)));
+  CHECK(same(firstAttemptError([] { sensor.frame[4] ^= 1; }), dhtErrorName(DhtError::Checksum)));
+  CHECK(same(firstAttemptError([] {
+               const uint8_t f[5] = {60, 5, 25, 0, 90};
+               memcpy(sensor.frame, f, 5);
+             }),
+             dhtErrorName(DhtError::UnsupportedEncoding)));
 
   // Every phase in range but the frame too slow overall: the whole-frame
   // deadline still ends the capture, bounding the time interrupts are masked.
-  CHECK(firstAttemptError([] {
-          sensor.bitLowUs = 80;
-          sensor.oneHighUs = 100;
-          memset(sensor.frame, 0xFF, 5);
-        }) == DhtError::BitTimeout);
+  CHECK(same(firstAttemptError([] {
+               sensor.bitLowUs = 80;
+               sensor.oneHighUs = 100;
+               memset(sensor.frame, 0xFF, 5);
+             }),
+             dhtErrorName(DhtError::BitTimeout)));
   CHECK(mock::criticalMaxUs > 0 && mock::criticalMaxUs <= DHT_FRAME_DEADLINE_US + 10);
 }
 
 static void testPrecheckRejects() {
-  resetWorld();
+  resetWithDht();
   shortAB = true;  // simulated A-B short
   runMs(1000);
-  CHECK(probeStatus().phase == ProbePhase::Fault);
+  CHECK(phase() == ProbePhase::Fault);
   CHECK(probeStatus().precheck == PrecheckResult::SuspiciousCoupling);
   CHECK(allProbesPlainInput());
   CHECK(collectSessions().count == 0);  // nothing was ever powered
   runMs(20000);                         // latched: no automatic retry
-  CHECK(probeStatus().phase == ProbePhase::Fault && collectSessions().count == 0);
+  CHECK(phase() == ProbePhase::Fault && collectSessions().count == 0);
 
   CHECK(probeRequestRetry());  // fault still present: rejected again
   runMs(1000);
-  CHECK(probeStatus().phase == ProbePhase::Fault && collectSessions().count == 0);
+  CHECK(phase() == ProbePhase::Fault && collectSessions().count == 0);
 
   shortAB = false;  // fixed: retry reruns the whole precheck, then scans
   CHECK(probeRequestRetry());
   CHECK(!probeRequestRetry());  // only valid from Fault
   runMs(2000);
-  CHECK(probeStatus().phase == ProbePhase::Scanning);
+  CHECK(phase() == ProbePhase::Scanning);
   CHECK(probeStatus().precheck == PrecheckResult::NoObviousCoupling);
   CHECK(collectSessions().count >= 1 && collectSessions().violations == 0);
 
-  resetWorld();
+  resetWithDht();
   flakyA = true;  // inconsistent readings also veto
   runMs(1000);
-  CHECK(probeStatus().phase == ProbePhase::Fault);
+  CHECK(phase() == ProbePhase::Fault);
   CHECK(probeStatus().precheck == PrecheckResult::InconsistentReadings);
   CHECK(collectSessions().count == 0);
 
@@ -600,44 +769,354 @@ static void testPrecheckRejects() {
   sensor.respond = false;
   CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 3000));
   shortAB = true;
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Fault; }, 3000));
+  CHECK(runUntil([] { return phase() == ProbePhase::Fault; }, 3000));
   CHECK(!probeStatus().hasMapping && !probeStatus().detected);
+  CHECK(probeStatus().componentName == nullptr);
   CHECK(allProbesPlainInput());
+
+  // A rejected socket is never handed to any driver.
+  FakeDriver fake(1, "Fake A");
+  fake.acceptPerm = 0;
+  useDrivers(&fake);
+  resetWorld();
+  shortAB = true;
+  runMs(2000);
+  CHECK(phase() == ProbePhase::Fault && fake.calls == 0);
 }
 
 static void testRollover() {
   // millis() wraps ~600 ms in, during the first power-up stabilization.
-  resetWorld((static_cast<uint64_t>(0xFFFFFFFFu) - 600) * 1000);
+  resetWithDht((static_cast<uint64_t>(0xFFFFFFFFu) - 600) * 1000);
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[0];
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Detected; }, 5000));
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
   const SessionLog log = collectSessions();
   CHECK(log.count == 1 && log.violations == 0);
-  CHECK(log.s[0].firstStartUs - log.s[0].startUs >= (PROBE_POWER_STABILIZE_MS - 1) * 1000);
-  CHECK(log.s[0].firstStartUs - log.s[0].startUs <= (PROBE_POWER_STABILIZE_MS + 2) * 1000);
+  CHECK(log.s[0].firstStartUs - log.s[0].startUs >= (DHT_POWER_STABILIZE_MS - 1) * 1000);
+  CHECK(log.s[0].firstStartUs - log.s[0].startUs <= (DHT_POWER_STABILIZE_MS + 2) * 1000);
   CHECK(millis() < 10000);  // the counter really wrapped
 
   // micros() wraps inside every capture.
-  resetWorld();
+  resetWithDht();
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[0];
   sensor.wrapMicrosAtRelease = true;
-  CHECK(runUntil([] { return probeStatus().phase == ProbePhase::Detected; }, 5000));
-  CHECK(probeStatus().temperatureDeciC == 250 && probeStatus().humidityPct == 60);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
+  CHECK(same(probeStatus().telemetry1, "T: 25*C  |  H: 60%"));
+}
+
+// ---- Dht11Driver contract, driven directly ---------------------------------
+
+static void powerByHand(const ProbeMapping &m) {  // the engine's job, done manually here
+  resetTestPins();
+  digitalWrite(gpioOf(m.gnd), LOW);
+  pinMode(gpioOf(m.gnd), OUTPUT);
+  digitalWrite(gpioOf(m.vcc), HIGH);
+  pinMode(gpioOf(m.vcc), OUTPUT);
+  pinMode(gpioOf(m.data), INPUT_PULLUP);
+  mock::nowUs += DHT_POWER_STABILIZE_MS * 1000ULL;
+}
+
+static void testDht11DriverContract() {
+  useDrivers();  // the engine stays idle; this test drives the driver itself
+  resetWorld();
+  Dht11Driver d;
+  char l1[PROBE_TELEMETRY_TEXT_LEN];
+  char l2[PROBE_TELEMETRY_TEXT_LEN];
+  const uint8_t vcc = gpioOf(0), data = gpioOf(1), gnd = gpioOf(2);
+  CHECK(same(d.getName(), "DHT11 Temp & Hum"));
+  CHECK(d.getRequirements().powerStabilizeMs == DHT_POWER_STABILIZE_MS);
+  CHECK(d.getRequirements().minAcquisitionIntervalMs == DHT_MIN_START_INTERVAL_MS);
+  CHECK(d.getRequirements().sampleIntervalMs == DHT_READ_INTERVAL_MS);
+
+  // Invalid buffers are rejected without being dereferenced.
+  CHECK(!d.readSample(nullptr, l2, sizeof l2));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+  CHECK(!d.readSample(l1, nullptr, sizeof l1));
+  memset(l1, 'x', sizeof l1);
+  CHECK(!d.readSample(l1, l2, 0));
+  CHECK(l1[0] == 'x');  // zero capacity: untouched
+
+  // Sampling before a successful probe fails cleanly with empty outputs.
+  d.reset();
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Idle);
+  CHECK(!d.readSample(l1, l2, sizeof l1));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+  CHECK(l1[0] == '\0' && l2[0] == '\0' && same(d.getFailureReason(), "not-probed"));
+
+  // Probe: Pending for the 20 ms start pulse, then one genuine frame. The
+  // driver touches only DATA.
+  sensor.attached = true;
+  sensor.wiring = PROBE_PERMUTATIONS[0];
+  powerByHand(PROBE_PERMUTATIONS[0]);
+  d.reset();
+  const size_t eventsBefore = mock::eventCount;
+  int pending = 0;
+  while (!d.probe(vcc, data, gnd) && pending < 100) {
+    CHECK(d.getOperationStatus() == DriverOperationStatus::Pending);
+    pending++;
+    mock::nowUs += 1000;
+  }
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Succeeded);
+  CHECK(pending == static_cast<int>(DHT_START_LOW_MS));
+  CHECK(sensor.responses == 1);
+  for (size_t i = eventsBefore; i < mock::eventCount; i++) CHECK(mock::events[i].pin == data);
+  CHECK(mock::drivesHigh(vcc) && mock::drivesLow(gnd));
+  CHECK(mock::criticalDepth == 0);
+
+  // A sample is a new acquisition; a small buffer is truncated but
+  // terminated, and stays empty while the operation is pending.
+  mock::nowUs += DHT_READ_INTERVAL_MS * 1000ULL;
+  char s1[6];
+  char s2[6];
+  memset(s1, 'x', sizeof s1);
+  memset(s2, 'x', sizeof s2);
+  CHECK(!d.readSample(s1, s2, sizeof s1));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Pending);
+  CHECK(s1[0] == '\0' && s2[0] == '\0');
+  mock::nowUs += DHT_START_LOW_MS * 1000ULL;
+  CHECK(d.readSample(s1, s2, sizeof s1));
+  CHECK(strcmp(s1, "T: 25") == 0 && s2[0] == '\0');
+  CHECK(sensor.responses == 2);
+
+  // Completed samples are never re-reported: the next call starts anew.
+  mock::nowUs += DHT_READ_INTERVAL_MS * 1000ULL;
+  CHECK(!d.readSample(l1, l2, sizeof l1));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Pending);
+  CHECK(sensor.responses == 2);
+
+  // Overlap is refused: probe() during a pending sample fails and releases
+  // DATA to plain INPUT (never driven, never pulled up).
+  CHECK(!d.probe(vcc, data, gnd));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+  CHECK(same(d.getFailureReason(), "contract-violation"));
+  CHECK(mock::pins[data].mode == INPUT);
+
+  // A failed sample clears the outputs.
+  powerByHand(PROBE_PERMUTATIONS[0]);
+  d.reset();
+  while (!d.probe(vcc, data, gnd) && d.getOperationStatus() == DriverOperationStatus::Pending) {
+    mock::nowUs += 1000;
+  }
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Succeeded);
+  sensor.respond = false;
+  mock::nowUs += DHT_READ_INTERVAL_MS * 1000ULL;
+  memset(l1, 'x', sizeof l1);
+  while (!d.readSample(l1, l2, sizeof l1) &&
+         d.getOperationStatus() == DriverOperationStatus::Pending) {
+    mock::nowUs += 1000;
+  }
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+  CHECK(l1[0] == '\0' && same(d.getFailureReason(), dhtErrorName(DhtError::NoResponse)));
+  sensor.respond = true;
+
+  // Changing arguments mid-operation is refused.
+  powerByHand(PROBE_PERMUTATIONS[0]);
+  d.reset();
+  CHECK(!d.probe(vcc, data, gnd));
+  CHECK(!d.probe(gnd, data, vcc));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+
+  // reset() during a start pulse only releases DATA to plain INPUT; after the
+  // engine has made the pins safe, reset() (twice) touches nothing.
+  powerByHand(PROBE_PERMUTATIONS[0]);
+  d.reset();
+  CHECK(!d.probe(vcc, data, gnd));
+  CHECK(mock::drivesLow(data));
+  d.reset();
+  CHECK(mock::pins[data].mode == INPUT);
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Idle);
+  resetTestPins();
+  const size_t quiet = mock::eventCount;
+  d.reset();
+  d.reset();
+  CHECK(mock::eventCount == quiet);
+  CHECK(mock::criticalDepth == 0);
+}
+
+// ---- Engine architecture with fake drivers ---------------------------------
+
+static void testPermutationMajorDriverOrder() {
+  FakeDriver a(1, "Fake A");
+  FakeDriver b(2, "Fake B");  // both always fail
+  useDrivers(&a, &b);
+  resetWorld();
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 60000));
+  CHECK(same(probeStatus().lastError, "fake-failed"));
+  CHECK(allProbesPlainInput());
+
+  CHECK(attemptCount == 2 * PROBE_PERMUTATION_COUNT);
+  for (int i = 0; i < attemptCount; i++) {  // permutation-major, registry order inside
+    CHECK(attempts[i].perm == i / 2 && attempts[i].driver == 1 + i % 2 && !attempts[i].sample);
+  }
+  CHECK(a.sampleStarts == 0 && b.sampleStarts == 0);
+  CHECK(a.unpoweredStarts == 0 && b.unpoweredStarts == 0);  // the engine powered each attempt
+  CHECK(a.resets >= 1 + PROBE_PERMUTATION_COUNT && b.resets >= 1 + PROBE_PERMUTATION_COUNT);
+  CHECK(a.unsafeResets == 0 && b.unsafeResets == 0);  // pins were safe before every reset
+
+  // Every attempt, even on the same permutation, gets its own power cycle,
+  // precheck and power-off gap, and waits for the driver's stabilization.
+  const SessionLog log = collectSessions();
+  CHECK(log.violations == 0);
+  CHECK(log.count == attemptCount);
+  for (int i = 0; i < log.count && i < attemptCount; i++) {
+    CHECK(sessionPowers(log.s[i], PROBE_PERMUTATIONS[i / 2]));
+    CHECK(attempts[i].us - log.s[i].startUs >= (a.req.powerStabilizeMs - 1) * 1000ULL);
+    if (i > 0) CHECK(log.s[i].startUs - log.s[i - 1].endUs >= (PROBE_POWER_OFF_MS - 1) * 1000);
+  }
+
+  runMs(PROBE_RESCAN_INTERVAL_MS - 50);  // rescan interval preserved
+  CHECK(phase() == ProbePhase::NoComponent && attemptCount == 2 * PROBE_PERMUTATION_COUNT);
+}
+
+static void testLaterDriverAndConfirmation() {
+  FakeDriver a(1, "Fake A");
+  FakeDriver b(2, "Fake B");
+  b.acceptPerm = 0;
+  useDrivers(&a, &b);
+  resetWorld();
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 10000));
+  CHECK(same(probeStatus().componentName, "Fake B"));
+  CHECK(a.probeStarts == 1 && b.probeStarts == 1);
+  CHECK(probeStatus().mapping.vcc == PROBE_PERMUTATIONS[0].vcc &&
+        probeStatus().mapping.gnd == PROBE_PERMUTATIONS[0].gnd);
+  CHECK(!probeStatus().detected && !probeStatus().readingValid);
+
+  // Reading the snapshot (what the OLED does) never acquires or confirms.
+  const int callsBefore = b.calls;
+  for (int i = 0; i < 1000; i++) {
+    char m[PROBE_MAPPING_TEXT_LEN];
+    formatProbeMapping(probeStatus().mapping, m, sizeof m);
+  }
+  CHECK(b.calls == callsBefore && !probeStatus().detected);
+
+  // Confirmation needs genuinely new acquisitions: probe + new sample(s).
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 2000));
+  CHECK(b.probeStarts == 1 && b.sampleStarts == PROBE_CONFIRM_FRAMES - 1);
+  CHECK(same(probeStatus().telemetry1, "Fake B #1") && same(probeStatus().telemetry2, "second line"));
+
+  // Monitoring delegates only to the active driver, at its sample interval.
+  const int aCalls = a.calls;
+  runMs(5 * b.req.sampleIntervalMs + 50);
+  CHECK(a.calls == aCalls);
+  CHECK(b.sampleStarts == PROBE_CONFIRM_FRAMES - 1 + 5 && b.probeStarts == 1);
+  CHECK(same(probeStatus().telemetry1, "Fake B #6"));
+  CHECK(b.unpoweredStarts == 0);
+}
+
+static void testPendingIsNotFailure() {
+  FakeDriver a(1, "Fake A");
+  FakeDriver b(2, "Fake B");
+  a.acceptPerm = 0;
+  a.pendingCalls = 200;  // well inside a.req.operationTimeoutMs
+  useDrivers(&a, &b);
+  resetWorld();
+  CHECK(runUntil([&] { return a.probeStarts == 1; }, 2000));
+  runMs(150);
+  CHECK(a.getOperationStatus() == DriverOperationStatus::Pending);
+  CHECK(a.probeStarts == 1 && b.calls == 0);  // same operation; registry not advanced
+  CHECK(probeStatus().scanIndex == 1 && probeStatus().consecutiveFailures == 0);
+  CHECK(probeStatus().lastError == nullptr);
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 1000));
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 3000));  // pending sample too
+  CHECK(b.calls == 0 && probeStatus().consecutiveFailures == 0);
+
+  // A driver that never completes is abandoned after its own timeout, torn
+  // down and reset, and the next driver is tried.
+  FakeDriver stuck(1, "Fake Stuck");
+  FakeDriver next(2, "Fake Next");
+  stuck.acceptPerm = 0;
+  stuck.pendingCalls = 1000000;
+  next.acceptPerm = 0;
+  useDrivers(&stuck, &next);
+  resetWorld();
+  CHECK(runUntil([&] { return stuck.resets == 2; }, 3000));  // init + timeout
+  CHECK(same(probeStatus().lastError, "operation-timeout") && allProbesPlainInput());
+  CHECK(attempts[0].driver == 1 && attemptCount == 1);
+  CHECK(mock::nowUs / 1000 - attempts[0].us / 1000 >= stuck.req.operationTimeoutMs);
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 3000));
+  CHECK(same(probeStatus().componentName, "Fake Next") && stuck.unsafeResets == 0);
+}
+
+static void testRequirementsDriveScheduling() {
+  FakeDriver a(1, "Fake A");
+  a.acceptPerm = 0;
+  a.req = {250, 600, 200, 1000};  // sample interval below the minimum: the minimum wins
+  useDrivers(&a);
+  resetWorld();
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
+  runMs(3000);
+  const SessionLog log = collectSessions();
+  CHECK(log.count == 1 && log.violations == 0);
+  CHECK(attemptCount >= 4 && !attempts[0].sample);
+  const uint64_t stabilizeUs = attempts[0].us - log.s[0].startUs;
+  CHECK(stabilizeUs >= 249000 && stabilizeUs <= 252000);
+  for (int i = 1; i < attemptCount; i++) {
+    const uint64_t gapUs = attempts[i].us - attempts[i - 1].us;
+    CHECK(attempts[i].sample && gapUs >= 599000 && gapUs <= 601000);
+  }
+}
+
+static void testRemovalClearsActiveDriver() {
+  FakeDriver a(1, "Fake A");
+  FakeDriver b(2, "Fake B");
+  b.acceptPerm = 2;
+  useDrivers(&a, &b);
+  resetWorld();
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 20000));
+  const int detectedAt = attemptCount;
+  char shown[PROBE_TELEMETRY_TEXT_LEN];
+  snprintf(shown, sizeof shown, "%s", probeStatus().telemetry1);
+
+  b.acceptPerm = -1;  // component pulled out
+  b.samplesSucceed = false;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 2000));
+  CHECK(phase() == ProbePhase::Retrying && same(probeStatus().telemetry1, shown));
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 10000));
+  CHECK(probeStatus().componentName == nullptr && !probeStatus().hasMapping);
+  CHECK(!probeStatus().detected && !probeStatus().readingValid);
+  CHECK(probeStatus().telemetry1[0] == '\0' && probeStatus().telemetry2[0] == '\0');
+  CHECK(allProbesPlainInput() && a.unsafeResets == 0 && b.unsafeResets == 0);
+  for (int i = detectedAt; i < attemptCount; i++) {  // recovery used only the saved driver
+    CHECK(attempts[i].driver == 2 && attempts[i].perm == 2);
+  }
+
+  // After the rescan interval, discovery restarts from the first driver.
+  const int before = attemptCount;
+  runMs(PROBE_RESCAN_INTERVAL_MS + 1000);
+  CHECK(attemptCount > before && attempts[before].driver == 1 && attempts[before].perm == 0);
+}
+
+static void testEmptyRegistry() {
+  useDrivers();
+  resetWorld();
+  runMs(20000);
+  CHECK(phase() == ProbePhase::NoComponent);
+  for (size_t i = 0; i < mock::eventCount; i++) {
+    if (nodeOf(mock::events[i].pin) >= 0) CHECK(mock::events[i].mode == INPUT);  // no pulls, no power
+  }
+  CHECK(!probeRequestRetry());
 }
 
 #else  // !PINDEX_POWERED_PROBING_ENABLED
 
 static void testDisabledNeverDrives() {
+  FakeDriver a(1, "Fake A");
+  FakeDriver b(2, "Fake B");
+  a.acceptPerm = 0;
+  b.acceptPerm = 0;
+  useDrivers(&a, &b);
   mock::reset(1000000ULL);
+  attemptCount = 0;
   initProbeEngine();
   const uint32_t rev = probeStatus().revision;
   runMs(30000);
-  CHECK(probeStatus().phase == ProbePhase::Disabled);
+  CHECK(phase() == ProbePhase::Disabled);
   CHECK(probeStatus().revision == rev);
   CHECK(!probeRequestRetry());  // a retry never bypasses the setting
   runMs(1000);
-  CHECK(probeStatus().phase == ProbePhase::Disabled);
+  CHECK(phase() == ProbePhase::Disabled);
+  CHECK(a.calls == 0 && b.calls == 0 && attemptCount == 0);  // no driver ever runs
 
   int probeEvents = 0;
   for (size_t i = 0; i < mock::eventCount; i++) {
@@ -664,6 +1143,13 @@ int main() {
   testCaptureErrors();
   testPrecheckRejects();
   testRollover();
+  testDht11DriverContract();
+  testPermutationMajorDriverOrder();
+  testLaterDriverAndConfirmation();
+  testPendingIsNotFailure();
+  testRequirementsDriveScheduling();
+  testRemovalClearsActiveDriver();
+  testEmptyRegistry();
   CHECK(lockedPinModes == 0);  // pinMode() never ran inside the capture lock
 #else
   testDisabledNeverDrives();

@@ -48,26 +48,36 @@ void drawStatusScreen(const char *line1, const char *line2) {
   oled.display();
 }
 
-// DHT11 result. All lines use size 1; the widest, the mapping, is 126px.
-void drawDhtScreen(const ProbeStatus &s) {
+// Detected-component result from the engine snapshot: driver name, the
+// driver's telemetry lines and the mapping. No sensor-specific text here.
+// All lines are size 1 (21 glyphs max); the mapping is the widest at 126px.
+void drawResultScreen(const ProbeStatus &s) {
   char line[32];
+  const bool twoLines = s.telemetry2[0] != '\0';
   oled.clearDisplay();
-  drawCentered("DHT11 Temp & Hum", 1, 2);  // rows 2-9
+  drawCentered(s.componentName != nullptr ? s.componentName : "", 1, 2);  // rows 2-9
   oled.drawFastHLine(0, 12, OLED_WIDTH, SSD1306_WHITE);
 
-  snprintf(line, sizeof line, "T: %d*C  |  H: %u%%", s.temperatureDeciC / 10,
-           (unsigned)s.humidityPct);
-  drawCentered(line, 1, 20);  // rows 20-27
+  if (twoLines) {
+    drawCentered(s.telemetry1, 1, 16);  // rows 16-23
+    drawCentered(s.telemetry2, 1, 26);  // rows 26-33
+  } else {
+    drawCentered(s.telemetry1, 1, 20);  // rows 20-27
+  }
 
   formatProbeMapping(s.mapping, line, sizeof line);
-  drawCentered(line, 1, 34);  // rows 34-41
+  drawCentered(line, 1, twoLines ? 37 : 34);  // rows 37-44 or 34-41
 
   if (s.readingStale) {
     // Inverted bar so old values are never mistaken for live ones.
     oled.fillRect(0, 48, OLED_WIDTH, 16, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
-    snprintf(line, sizeof line, "STALE - fail %u/%u", (unsigned)s.consecutiveFailures,
-             (unsigned)PROBE_MAX_CONSECUTIVE_FAILURES);
+    if (s.consecutiveFailures > 0) {
+      snprintf(line, sizeof line, "STALE - fail %u/%u", (unsigned)s.consecutiveFailures,
+               (unsigned)PROBE_MAX_CONSECUTIVE_FAILURES);
+    } else {
+      snprintf(line, sizeof line, "STALE");  // reconnected, awaiting a new sample
+    }
     drawCentered(line, 1, 52);  // rows 52-59
     oled.setTextColor(SSD1306_WHITE);
   } else {
@@ -114,7 +124,7 @@ void showProbeStatus(const ProbeStatus &s) {
   switch (s.phase) {
     case ProbePhase::Detected:
     case ProbePhase::Retrying:
-      drawDhtScreen(s);
+      drawResultScreen(s);
       break;
     case ProbePhase::Disabled:
       drawStatusScreen(kReadyLine, "Probing disabled");
@@ -125,7 +135,8 @@ void showProbeStatus(const ProbeStatus &s) {
       drawStatusScreen(line, "Insert Component...");
       break;
     case ProbePhase::Confirming:
-      drawStatusScreen("DHT11 candidate", "Confirming...");
+      drawStatusScreen(s.componentName != nullptr ? s.componentName : "Candidate",
+                       "Confirming...");
       break;
     case ProbePhase::NoComponent:
       drawStatusScreen("No Component /", "Unknown");

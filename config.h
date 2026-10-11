@@ -43,15 +43,17 @@
 #define PRECHECK_SAMPLE_INTERVAL_MS 2UL  // between samples
 #define PRECHECK_SAMPLES 4               // per pull-up source node
 
-// Power sequencing.
-#define PROBE_POWER_STABILIZE_MS 1100UL  // power-up to first start request
-#define PROBE_POWER_OFF_MS 300UL         // between permutations; NOT proof of discharge
+// Engine power policy (driver-independent). Stabilization and acquisition
+// spacing come from each driver's DriverRequirements.
+#define PROBE_POWER_OFF_MS 300UL         // between attempts; NOT proof of discharge
 #define PROBE_RETRY_COOLDOWN_MS 1000UL   // after a failed read on the saved mapping
 #define PROBE_RESCAN_INTERVAL_MS 5000UL  // idle time before discovery restarts
 #define PROBE_CONFIRM_FRAMES 2           // consecutive valid frames to publish
 #define PROBE_MAX_CONSECUTIVE_FAILURES 3 // then removal is inferred
 
-// DHT single-wire protocol timing.
+// DHT11 driver (src/drivers/dht11_driver.cpp): requirements and protocol timing.
+#define DHT_POWER_STABILIZE_MS 1100UL    // power-up to first start request
+#define DHT_OPERATION_TIMEOUT_MS 500UL   // engine abandons a still-pending acquisition
 #define DHT_START_LOW_MS 20UL            // host start pulse (DHT11 needs >= 18 ms)
 #define DHT_READ_INTERVAL_MS 2100UL      // start-to-start: confirmation and monitoring
 #define DHT_MIN_START_INTERVAL_MS 2000UL // spacing on the saved mapping, incl. retries

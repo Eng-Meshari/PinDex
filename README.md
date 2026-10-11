@@ -4,12 +4,15 @@
 labs. The goal is to let students insert a component or sensor module, have
 it identified, and get its pinout.
 
-> **Status: v0.2 (Phase 2).** Adds DHT11-compatible detection, A/B/C pinout
-> identification and a live temperature/humidity display.
-> **Powered probing is disabled by default** (`PINDEX_POWERED_PROBING_ENABLED 0`).
-> With the default build the probes stay high impedance and the display
-> shows *Probing disabled*. Nothing here identifies arbitrary components,
-> and inserting arbitrary components is not safe.
+> **Status: v0.2 + Phase 3.1 driver architecture.** DHT11-compatible
+> detection, A/B/C pinout identification and live telemetry. Sensor
+> protocols now live in drivers behind a generic probe engine.
+> **Powered probing** is controlled by `PINDEX_POWERED_PROBING_ENABLED` in
+> `config.h`. With `0` the probes stay high impedance and the display shows
+> *Probing disabled*; `1` must only be used behind the protected interface
+> described below. **Check its value before every upload.** Nothing here
+> identifies arbitrary components, and inserting arbitrary components is not
+> safe.
 
 ## Project files
 
@@ -17,10 +20,13 @@ it identified, and get its pinout.
 |---|---|
 | `PinDex.ino` | Sketch entry point: startup order, screen updates, Serial heartbeat and the `r` retry command. |
 | `config.h` | All pins, timings, thresholds, failure limits and the powered-probing setting. |
-| `display_manager.h/.cpp` | VSPI + SSD1306 setup, splash, idle, status and DHT11 result screens. |
-| `probe_engine.h/.cpp` | Owns the probe GPIOs: precheck, power sequencing, DHT capture, scan/confirm/monitor state machine. |
+| `display_manager.h/.cpp` | VSPI + SSD1306 setup; renders the engine's status snapshot (splash, idle, status, result screens). |
+| `probe_engine.h/.cpp` | Generic orchestrator: owns the probe GPIOs, precheck, power sequencing, permutation × driver discovery, confirmation, monitoring and removal. Knows no concrete sensor. |
+| `sensor_driver.h` | The abstract `SensorDriver` contract, `DriverOperationStatus` and `DriverRequirements`. |
+| `src/drivers/dht11_driver.h/.cpp` | `Dht11Driver`: DHT start pulse, bounded capture, validation and telemetry formatting. |
+| `src/drivers/driver_registry.h/.cpp` | The static driver table (priority order) and its read-only API. |
 | `dht11.h/.cpp` | Pure DHT11 frame decoding (timing → bits → bytes → values); no GPIO, host-testable. |
-| `tests/` | Host-side tests with a mock Arduino layer. Not compiled by the Arduino IDE. |
+| `tests/` | Host-side tests with a mock Arduino layer, fake drivers and a simulated DHT11. Not compiled by the Arduino IDE. |
 | `README.md` | This document. |
 | `.gitignore` | Keeps build output and editor/OS files out of version control. |
 
@@ -90,16 +96,18 @@ Each permutation assigns the three roles; the scan order is fixed:
 | 5 | A | C | B |
 | 6 | C | A | B |
 
-For every attempt the engine runs the precheck, then powers up in this
-order: GND driven LOW, VCC driven HIGH, DATA as `INPUT_PULLUP`. On the
+Within each permutation, the registered drivers are tried in registry
+order (permutation-major). Every driver attempt, even on an unchanged
+permutation, gets its own precheck and power cycle. The engine powers up in
+this order: GND driven LOW, VCC driven HIGH, DATA as `INPUT_PULLUP`. On the
 ESP32 core 3.x, `digitalWrite()` before `pinMode(OUTPUT)` sets the output
 latch first, so a pin never briefly drives the opposite level.
 
-Before moving to another permutation the engine tears down in this order:
-DATA pull-up/drive removed, VCC released, then all nodes set to plain
-`INPUT`. It then waits `PROBE_POWER_OFF_MS` (300 ms). That timed wait does
-not prove a capacitor has discharged, and the firmware never shorts nodes
-to discharge them.
+After a failed attempt the engine tears down in this order: DATA
+pull-up/drive removed, VCC released, then all nodes set to plain `INPUT`.
+Only then does it reset the driver. It then waits `PROBE_POWER_OFF_MS`
+(300 ms). That timed wait does not prove a capacitor has discharged, and
+the firmware never shorts nodes to discharge them.
 
 ## Pre-power check (diagnostic heuristic only)
 
@@ -127,8 +135,13 @@ protection remains necessary either way.
 
 ## Supported DHT11 profile
 
-DHT sensors use their own single-wire protocol; it is not Dallas/Maxim
-1-Wire. PinDex captures it in custom code with no DHT library.
+Implemented by `Dht11Driver` (`src/drivers/dht11_driver.cpp`). DHT sensors
+use their own single-wire protocol; it is not Dallas/Maxim 1-Wire. PinDex
+captures it in custom code with no DHT library.
+
+- **Driver requirements:** 1100 ms power stabilization, at least 2000 ms
+  between acquisitions (including retries), a 2100 ms sample interval, and
+  a 500 ms operation timeout.
 
 - **Start:** DATA held LOW for 20 ms (open-drain), then released; DATA is
   never driven HIGH.
@@ -164,24 +177,26 @@ every DHT-family sensor.
 
 ## Behaviour
 
-**Default build (probing disabled):** splash, then
-*v0.2 Ready / Probing disabled*. The probes stay plain `INPUT` and the
-Serial heartbeat continues once per second.
+**With `PINDEX_POWERED_PROBING_ENABLED 0`:** splash, then
+*v0.2 Ready / Probing disabled*. The probes stay plain `INPUT`, no driver
+ever runs, and the Serial heartbeat continues once per second.
 
-**Powered build:**
+**With powered probing enabled** (described for the DHT11 driver, the only
+one registered):
 
 1. **Scan:** the precheck runs, then permutation 1 is powered. The engine
-   waits 1100 ms, sends the start pulse and captures the reply. A failed
-   permutation is torn down before the next one. The screen shows
-   *Scanning n/6*.
-2. **No result:** if all six permutations fail, the screen shows
-   *No Component / Unknown*, the probes are reset and the scan repeats
-   after 5 s.
-3. **Candidate:** on the first valid frame the mapping is saved and stays
-   powered, and scanning stops (*DHT11 candidate / Confirming...*).
-4. **Confirmation:** another frame is requested 2100 ms later. Two
-   consecutive valid frames publish the result. The readings do not have
-   to match.
+   waits 1100 ms, then `probe()` sends the start pulse and captures the
+   reply. A failed attempt is torn down before the next one. The screen
+   shows *Scanning n/6*.
+2. **No result:** if every driver fails on all six permutations, the
+   screen shows *No Component / Unknown*, the probes are reset and the scan
+   repeats after 5 s.
+3. **Candidate:** on the first valid frame (a successful `probe()`), the
+   driver and mapping are saved and stay powered, and scanning stops. The
+   screen shows the driver name and *Confirming...*.
+4. **Confirmation:** a new acquisition (`readSample()`) is requested
+   2100 ms later. Two consecutive valid acquisitions publish the result.
+   The readings do not have to match.
 5. **Live display:** the result screen is redrawn only when something
    shown changes:
 
@@ -192,13 +207,17 @@ Serial heartbeat continues once per second.
    LIVE
    ```
 
-   The mapping line always lists A, B, C in that order. Readings repeat
-   every 2100 ms.
+   Line 1 is the driver's `getName()`, line 2 its telemetry, and line 3
+   the engine's mapping. The mapping line always lists A, B, C in that
+   order. Readings repeat every 2100 ms.
 6. **Failures:** any capture or validation failure immediately tears down
-   power. The reading is marked stale (inverted *STALE - fail n/3* bar) and
-   the failure counter increments. Only the saved mapping is retried, after
-   a 1000 ms cooldown, a full precheck and a fresh 1100 ms stabilization.
-   Start requests stay at least 2000 ms apart.
+   power and resets the driver. The reading is marked stale (inverted
+   *STALE - fail n/3* bar) and the failure counter increments. Only the
+   saved driver and mapping are retried, after a 1000 ms cooldown, a full
+   precheck and a fresh 1100 ms stabilization. Acquisitions stay at least
+   2000 ms apart. A retry re-runs `probe()`: success clears the failure
+   counter, but the telemetry stays marked *STALE* until the next
+   `readSample()` publishes a new value, about 2.1 s later.
 7. **Removal:** there is no removal sensor. Removal is **inferred** from
    three consecutive failed scheduled reads. The result is then cleared,
    the probes return to high impedance, *Insert Component...* is shown and
@@ -208,9 +227,10 @@ Serial heartbeat continues once per second.
 
 The splash is drawn once at boot. When it expires the screen follows the
 probe status, so the splash can never overwrite a result or a fault.
-Serial prints one line per status change, e.g.
-`probe: detected [A:VCC | B:DAT | C:GND] T=25.0C H=60%`, plus the heartbeat
-`heartbeat uptime=12s display=ok probe=detected`.
+Serial prints the registered drivers at boot and one line per status
+change, e.g.
+`probe: detected DHT11 Temp & Hum [A:VCC | B:DAT | C:GND] "T: 25*C  |  H: 60%"`,
+plus the heartbeat `heartbeat uptime=12s display=ok probe=detected`.
 
 ### Timing and latency
 
@@ -222,14 +242,121 @@ Serial prints one line per status change, e.g.
 | Confirmed result | the above + 2.1 s (≈ 3.3 s for #1, ≈ 10.5 s for #6) |
 | Removal inferred after extraction | ≈ 4.3–6.5 s |
 
-The per-permutation 1100 ms stabilization dominates scan time.
+The per-permutation 1100 ms stabilization dominates scan time. Each extra
+registered driver adds its own attempt (precheck, stabilization, operation,
+power-off) to every permutation.
 
 **Blocking:** all millisecond waits are cooperative. The only busy wait is
-the DHT capture. It masks interrupts on the running core (a FreeRTOS
+the DHT capture inside `Dht11Driver`. It masks interrupts on the running core (a FreeRTOS
 critical section that restores the previous state on every exit) for at
 most 6.5 ms, typically about 4–5 ms per frame. The 20 ms start pulse,
 stabilization, retries, Serial output and display updates never run inside
 it.
+
+## Sensor driver architecture
+
+The probe engine is a generic orchestrator. Each sensor protocol is a
+`SensorDriver` (`sensor_driver.h`) listed in a fixed registry. The engine
+contains no sensor names, decoding, type checks or sensor-specific
+branches. The display renders only the engine's `ProbeStatus` snapshot, so
+redrawing never triggers an acquisition.
+
+### Ownership
+
+| Engine (`probe_engine.cpp`) | Driver (`src/drivers/…`) |
+|---|---|
+| Powered-probing permission and the weak-pull precheck | DATA-line protocol signalling (e.g. the DHT start pulse) |
+| Permutation choice and the driver order inside each permutation | Handshake, bounded capture, decoding and validation |
+| VCC/GND power sequencing, stabilization scheduling, teardown to high impedance | Its own sample storage and telemetry formatting |
+| Confirmation counting, retry limit, removal inference | Its own critical sections (the DHT capture only) |
+| Candidate/active driver and mapping; the result snapshot | — |
+
+A driver never powers VCC/GND, picks a permutation, draws on the OLED or
+changes engine state. On every terminal failure the engine first makes the
+pins safe, then calls the driver's `reset()`.
+
+### Lifecycle and contract
+
+- `probe(vcc, data, gnd)` and `readSample(line1, line2, maxLen)` are
+  **cooperative**:
+  - The first call starts an operation and later calls advance it.
+    Arguments must not change while it is pending.
+  - `true` means a newly completed success. On `false`, check
+    `getOperationStatus()`: `Pending` is not a failure.
+  - Once an operation has completed, the next call starts a new
+    acquisition. A completed sample is never reported twice.
+  - The engine never overlaps the two operations; a driver fails an
+    overlapping call.
+- `probe()` succeeds only after a genuine acquisition. `readSample()`
+  needs a prior successful `probe()` and performs a new acquisition every
+  time. Confirmation counts the probe plus new samples
+  (`PROBE_CONFIRM_FRAMES` = 2), never cached text.
+- **Buffers:**
+  - `maxLen` is the capacity of each buffer, including the terminator.
+  - Null pointers or zero capacity are rejected without being touched.
+  - Valid buffers are always terminated, and filled only on a completed
+    success.
+  - Drivers never keep the caller's pointers.
+- `reset()` is idempotent and cancels any pending operation. It may only
+  make a pin safer (e.g. release a held line to plain `INPUT`); it never
+  energises one.
+- `getRequirements()` returns fixed `DriverRequirements`:
+  - power stabilization;
+  - minimum acquisition interval;
+  - sample interval (raised to the minimum if it is lower);
+  - operation timeout, after which the engine fails an operation that is
+    still `Pending`.
+- `getName()` returns a stable string used as the result title.
+  `getFailureReason()` (optional) feeds the Serial `err=` field.
+
+### Adding a driver
+
+1. Implement `class MyDriver final : public SensorDriver` in
+   `src/drivers/my_driver.h/.cpp`. Arduino compiles `src/` recursively.
+   Use relative includes such as `"../../sensor_driver.h"`.
+2. In `src/drivers/driver_registry.cpp`, include its header, add
+   `MyDriver myDriver;` beside `dht11Driver`, and add `&myDriver` to
+   `registeredDrivers[]`. Earlier entries are tried first. Drivers are
+   static, never allocated.
+
+No engine or display change is needed. Add tests with the mock in
+`tests/` before trying the driver on hardware.
+
+### Topology limits
+
+The lifecycle is generic, but today's **power and mapping policy** is
+specific to the three-node VCC/DATA/GND socket. Every driver is offered the
+same six permutations, powered GND-first from GPIOs.
+
+- **Supported:** three-pin, single-data-line sensors that tolerate that
+  policy.
+- **Passive components and switches:** these need different excitation
+  (current-limited measurement, not a supply rail) and must not be powered
+  with the DHT policy.
+- **I2C parts:** these commonly need separate SDA and SCL lines plus
+  power, which this socket cannot provide.
+
+Such families need a capability or topology descriptor added beside
+`DriverRequirements`, plus a matching engine policy, not branches inside
+the state machine. No such driver is implemented.
+
+### What this refactor preserved
+
+Unchanged:
+- the powered-probing setting and the weak-pull precheck with its latched
+  fault and `r` retry;
+- GND-first power-up and DATA-first teardown;
+- the 300 ms off-time between every attempt;
+- the DHT timing: 1100 ms stabilization, 20 ms start pulse, 120 µs and
+  6500 µs capture limits, 2100 ms reads, 2000 ms minimum spacing;
+- two-frame confirmation, three-failure removal and the 5 s rescan;
+- the FreeRTOS critical section, which restores interrupt state on every
+  exit.
+
+Visible differences:
+- the confirming screen shows the driver name;
+- Serial prints the driver's telemetry text instead of tenth-degree values;
+- after a recovered failure, telemetry stays *STALE* until the next sample.
 
 ## Software requirements
 
@@ -263,14 +390,17 @@ To enable powered probing, only once the prerequisites above are met, set
 
 ## Host tests
 
-`tests/test_pindex.cpp` exercises the decoder and the probe state machine
-against `tests/mock/Arduino.h`, a simulated GPIO, clock and DHT11. Faults
-and shorts are simulated only. The tests need a host C++17 compiler (not
-the ESP32 toolchain). From the `PinDex` folder:
+`tests/test_pindex.cpp` exercises the decoder, the `Dht11Driver` contract
+and the probe engine against `tests/mock/Arduino.h` (simulated GPIO, clock
+and DHT11). It also uses fake drivers to check the architecture. The test
+file defines the registry functions itself, so it is linked **without**
+`src/drivers/driver_registry.cpp`. Faults and shorts are simulated only.
+The tests need a host C++17 compiler (not the ESP32 toolchain). From the
+`PinDex` folder:
 
 ```text
-g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1 tests/test_pindex.cpp probe_engine.cpp dht11.cpp -o build/test_enabled
-g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=0 tests/test_pindex.cpp probe_engine.cpp dht11.cpp -o build/test_disabled
+g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1 tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp -o build/test_enabled
+g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=0 tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp -o build/test_disabled
 ```
 
 Run both binaries; each exits non-zero on any failure.
@@ -280,7 +410,8 @@ Run both binaries; each exits non-zero on any failure.
 Do these in order, at a bench, with the module's datasheet at hand. Stop at
 the first unexpected result.
 
-1. **Baseline:** keep the default (disabled) build and an empty socket.
+1. **Baseline:** set `PINDEX_POWERED_PROBING_ENABLED 0` and use an empty
+   socket.
    Confirm *Probing disabled*, the heartbeat, and that the probe nodes are
    high impedance.
 2. **Interface:** build the protected interface described above and have
@@ -324,8 +455,8 @@ tests instead.
   (GND, VCC, D0, D1, RES, DC, CS). 4-pin I2C modules (GND, VCC, SCL, SDA)
   will not work with this wiring.
 - **Garbled Serial output:** set the Serial Monitor to 115200 baud.
-- **Probing disabled:** expected with the default build; see *Powered
-  probing: prerequisites*.
+- **Probing disabled:** expected with `PINDEX_POWERED_PROBING_ENABLED 0`;
+  see *Powered probing: prerequisites*.
 - **Socket rejected:** the precheck saw coupling or unstable readings.
   Remove the part, check the interface, then send `r`. A module's onboard
   pull-up can cause this (see the precheck limits).
@@ -336,7 +467,7 @@ tests instead.
 
 ## Scope and safety limits
 
-- In the default build every probe pin is a plain input with internal pull
+- With powered probing set to `0`, every probe pin is a plain input with internal pull
   resistors disabled (high impedance). This only means the firmware does
   not drive the probes. It is **not** protection against short circuits,
   overvoltage, ESD or charged capacitors.
