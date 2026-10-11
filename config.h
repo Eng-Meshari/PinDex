@@ -35,7 +35,7 @@
 // protection against wrong polarity and pin assignment (see README).
 // The #ifndef only lets host tests override it with -D.
 #ifndef PINDEX_POWERED_PROBING_ENABLED
-#define PINDEX_POWERED_PROBING_ENABLED 0
+#define PINDEX_POWERED_PROBING_ENABLED 1
 #endif
 
 // Weak-pull precheck (diagnostic heuristic, not a safety test).
