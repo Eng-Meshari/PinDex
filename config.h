@@ -31,24 +31,41 @@
 #define PINDEX_VERSION "0.2"
 
 // ---------------------------------------------------------------------------
-// Powered probing (three-wire DHT11 and four-wire ultrasonic detection)
+// Powered probing (three-wire DHT11, four-wire I2C and ultrasonic detection)
 // ---------------------------------------------------------------------------
-// 0: nothing is ever powered and no probe GPIO is driven as VCC/GND or a
-// trigger (passive weak-pull probing is controlled separately below; both
-// 0 = probes stay plain INPUT and the display shows "Probing disabled").
+// 0: nothing is ever powered and no probe GPIO is driven as VCC/GND, a
+// trigger or a bus (passive weak-pull probing is controlled separately
+// below; both 0 = probes stay plain INPUT and the display shows "Probing
+// disabled"). It also overrides PINDEX_I2C_GPIO_POWER_ENABLED.
 // 1: run the powered scans:
 //   * three-wire (24 mappings): probe GPIOs driven as a nominal 3.3V
 //     supply where the precheck shows no coupling on the VCC node;
-//   * four-wire (24 mappings): ONLY if the protected four-wire backend
-//     (four_wire_backend.h) reports the capabilities the driver needs. The
-//     shipped backend reports none, so no four-wire attempt runs; this
-//     setting cannot enable that hardware.
+//   * four-wire (24 mappings): ONLY with an eligible supply. The protected
+//     four-wire backend (four_wire_backend.h) must report the capabilities
+//     the driver needs (the shipped one reports none), or, for the I2C
+//     driver only, the experimental GPIO profile below must be enabled.
+//     This setting cannot enable either on its own.
 // Setting 1 is a DEPLOYMENT PREREQUISITE, NOT A SAFETY MECHANISM. Only enable
 // it behind a reviewed interface with current limiting, fault handling and
 // protection against wrong polarity and pin assignment (see README).
 // The #ifndef only lets host tests override it with -D.
 #ifndef PINDEX_POWERED_PROBING_ENABLED
 #define PINDEX_POWERED_PROBING_ENABLED 1
+#endif
+
+// EXPERIMENTAL, default 0. 1: when no protected 3.3V backend exists, power
+// the I2C driver's four-wire mappings straight from probe GPIOs (candidate
+// GND driven LOW, VCC driven HIGH: a nominal 3.3V logic level, not a
+// regulated rail). Every precheck veto still applies, and
+// PINDEX_POWERED_PROBING_ENABLED 0 still disables it. This is NOT
+// electrical protection: software limits no fault current and prevents no
+// reverse-polarity damage, and many breakouts (regulators, LEDs, LCD
+// backlights, pull-ups, inrush) need more than a GPIO can source. Enable it
+// only for a module whose supply needs and tolerance of wrong assignments
+// you have evaluated (README). Never enable it because an address hint
+// suggests a low-current part. It never powers the 5V ultrasonic driver.
+#ifndef PINDEX_I2C_GPIO_POWER_ENABLED
+#define PINDEX_I2C_GPIO_POWER_ENABLED 1
 #endif
 
 // Passive weak-pull probing (Phase 3.2, src/drivers/passive_driver.cpp).
@@ -108,6 +125,20 @@
 #define ULTRASONIC_US_PER_CM 58.0f            // round-trip echo time per cm
 #define ULTRASONIC_MIN_DISTANCE_CM 2.0f       // accepted range, inclusive
 #define ULTRASONIC_MAX_DISTANCE_CM 300.0f
+
+// I2C scanner driver (src/drivers/i2c_driver.cpp, bus adapter i2c_bus.cpp).
+#define I2C_POWER_STABILIZE_MS 100UL      // supply on to bus start. An engineering choice, NOT a
+                                          // datasheet figure: validate on the actual module
+#define I2C_SCAN_FREQUENCY_HZ 100000UL    // standard mode
+#define I2C_TRANSACTION_TIMEOUT_MS 25     // Wire setTimeOut(): bounds one transaction (plus overhead)
+#define I2C_IDLE_SETTLE_MS 10UL           // SDA and SCL must read HIGH within this, before every
+                                          // transaction and before a result is accepted
+#define I2C_SWEEP_DEADLINE_MS 1000UL      // one whole 0x08-0x77 sweep, first to last address
+#define I2C_MAX_SWEEPS 3                  // per probe(): two consecutive sweeps must agree
+#define I2C_SAMPLE_INTERVAL_MS 2000UL     // liveness check and address rotation, start to start
+#define I2C_OPERATION_TIMEOUT_MS 3500UL   // engine abandons a still-pending operation
+#define I2C_FIRST_ADDRESS 0x08            // scan range, inclusive (0x00-0x07 and 0x78-0x7F are
+#define I2C_LAST_ADDRESS 0x77             // reserved and never addressed)
 
 // Supported DHT11 profile: plausibility window for decoded values.
 #define DHT11_HUMIDITY_MIN_PCT 5

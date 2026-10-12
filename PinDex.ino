@@ -1,11 +1,12 @@
 // PinDex - Smart Component & Sensor Identifier
 // Sensor drivers (src/drivers/) behind a generic probe engine on a
-// four-node A/B/C/D socket: a DHT11-compatible three-wire driver, an
-// HC-SR04-compatible four-wire driver (needs a protected backend this
-// board does not have) and a weak-pull passive/switch driver. Powered and
-// passive probing are controlled separately in config.h
-// (PINDEX_POWERED_PROBING_ENABLED, PINDEX_PASSIVE_PROBING_ENABLED); read
-// the README before enabling either.
+// four-node A/B/C/D socket: a DHT11-compatible three-wire driver, an I2C
+// address scanner and an HC-SR04-compatible driver (four-wire; both need a
+// protected backend this board does not have, the I2C scanner optionally
+// the experimental PINDEX_I2C_GPIO_POWER_ENABLED profile) and a weak-pull
+// passive/switch driver. Powered and passive probing are controlled
+// separately in config.h (PINDEX_POWERED_PROBING_ENABLED,
+// PINDEX_PASSIVE_PROBING_ENABLED); read the README before enabling any.
 
 #include "config.h"
 #include "display_manager.h"
@@ -18,6 +19,14 @@ static unsigned long splashStartMs = 0;
 static unsigned long lastHeartbeatMs = 0;
 static uint32_t shownRevision = 0;
 static uint32_t loggedRevision = 0;
+static bool loggedDetected = false;
+
+// The detected driver's cached diagnostics (e.g. every I2C address found);
+// prints nothing if there are none. Never triggers bus or pin activity.
+static void printDiagnostics() {
+  static char text[640];
+  if (probeFormatDiagnostics(text, sizeof text)) Serial.printf("diagnostics: %s\n", text);
+}
 
 static void logProbeStatus(const ProbeStatus &s) {
   Serial.printf("probe: %s", probePhaseName(s.phase));
@@ -48,17 +57,22 @@ static void logProbeStatus(const ProbeStatus &s) {
   if (s.consecutiveFailures > 0) Serial.printf(" fails=%u", (unsigned)s.consecutiveFailures);
   if (s.lastError != nullptr) Serial.printf(" err=%s", s.lastError);
   if (s.measurementUnavailable) Serial.print(" measurement-unavailable");
-  if (s.hardwareRequired != nullptr) Serial.printf(" hw-required=[%s]", s.hardwareRequired);
+  for (size_t i = 0; i < sensorDriverCount() && i < 8; i++) {
+    if (s.hardwareRequiredMask & (1u << i)) Serial.printf(" hw-required=[%s]", sensorDriverAt(i)->getName());
+  }
   if (s.phase == ProbePhase::Fault) {
     Serial.printf(" precheck=%s; send 'r' to retry", precheckResultName(s.precheck));
   }
   Serial.println();
+  if (s.detected && !loggedDetected) printDiagnostics();  // once per detection
+  loggedDetected = s.detected;
 }
 
 // Non-blocking: handles only bytes that have already arrived.
 //   r  retry after a latched fault
 //   c  clear the result and rescan (e.g. a switch left OPEN: an open switch
 //      cannot be told apart from removal)
+//   i  print the detected driver's diagnostics (e.g. every I2C address)
 //   other letters go to the detected driver (passive: l = guided LDR
 //   calibration start/cancel, d = take dark reference, b = take bright)
 static void handleSerialCommands() {
@@ -70,6 +84,8 @@ static void handleSerialCommands() {
     } else if (c == 'c' || c == 'C') {
       Serial.println(probeRequestClear() ? "clear: result cleared, rescanning"
                                          : "clear: ignored (probing disabled)");
+    } else if (c == 'i' || c == 'I') {
+      printDiagnostics();
     } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
       Serial.printf("command '%c': %s\n", c,
                     probeSendCommand(static_cast<char>(c)) ? "accepted" : "ignored");
@@ -92,11 +108,16 @@ void setup() {
   Serial.println(PINDEX_PASSIVE_PROBING_ENABLED
                      ? "Passive probing ENABLED: weak pull-up + open-drain sink; unpowered parts only."
                      : "Passive probing disabled.");
-  if (probeStatus().hardwareRequired != nullptr) {
-    Serial.printf("%s: hardware required (no protected four-wire backend); not attempted.\n",
-                  probeStatus().hardwareRequired);
+  if (PINDEX_POWERED_PROBING_ENABLED && PINDEX_I2C_GPIO_POWER_ENABLED) {
+    Serial.println("EXPERIMENTAL I2C GPIO power profile ENABLED: not protection (README).");
   }
-  Serial.println("Serial: r=retry fault, c=clear/rescan, l/d/b=guided LDR calibration.");
+  for (size_t i = 0; i < sensorDriverCount() && i < 8; i++) {
+    if (probeStatus().hardwareRequiredMask & (1u << i)) {
+      Serial.printf("%s: hardware required (no eligible supply profile); not attempted.\n",
+                    sensorDriverAt(i)->getName());
+    }
+  }
+  Serial.println("Serial: r=retry fault, c=clear/rescan, i=diagnostics, l/d/b=guided LDR calibration.");
 
   displayOk = initDisplay();
   if (displayOk) {

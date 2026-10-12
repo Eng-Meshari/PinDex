@@ -20,7 +20,8 @@ const DriverRequirements kRequirements = {
     DHT_MIN_START_INTERVAL_MS,  // minAcquisitionIntervalMs
     DHT_READ_INTERVAL_MS,       // sampleIntervalMs
     DHT_OPERATION_TIMEOUT_MS,   // operationTimeoutMs
-    0,                          // backendCapabilities: GPIO-powered, no four-wire backend
+    SupplyProfile::GpioLogic,   // supply: VCC/GND from GPIOs
+    true,                       // openDrainSignals: DATA is only pulled up or sunk
     {nullptr, nullptr},         // signalLabel: three-wire roles are VCC/DAT/GND
 };
 

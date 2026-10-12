@@ -14,8 +14,14 @@
 // or charged capacitors. Three-wire powered probing drives probe GPIOs as a
 // nominal 3.3V logic-level supply, not a regulated rail, and must only be
 // enabled behind a reviewed protected interface (see README). Four-wire
-// probing never uses a GPIO as a supply: it runs only on a backend that
-// reports the required capabilities (four_wire_backend.h).
+// probing runs only on a backend that reports the required capabilities
+// (four_wire_backend.h), except the Supply3V3 profile's experimental GPIO
+// path (PINDEX_I2C_GPIO_POWER_ENABLED, off by default), which is not
+// protection either.
+//
+// Teardown order (releaseAttempt()): the driver releases its signals and
+// peripherals while still powered, then the supply is removed, then every
+// node returns to plain INPUT.
 //
 // Routing: the weak-pull precheck only observes. A coupled pair (contact or
 // finite resistance; the digital test cannot tell which) never authorises
@@ -200,10 +206,12 @@ uint8_t nodeWithRole(const ProbeMapping &m, NodeRole role) {
 bool supported(const DriverRequirements &r) {
   switch (r.topology) {
     case ProbeTopology::ThreeWirePowered:
+      return r.excitation == ExcitationPolicy::ProtectedActive && r.supply == SupplyProfile::GpioLogic;
     case ProbeTopology::FourWirePowered:
-      return r.excitation == ExcitationPolicy::ProtectedActive;
+      return r.excitation == ExcitationPolicy::ProtectedActive &&
+             (r.supply == SupplyProfile::Backend5V || r.supply == SupplyProfile::Supply3V3);
     case ProbeTopology::TwoTerminal:
-      return r.excitation == ExcitationPolicy::WeakPullOnly;
+      return r.excitation == ExcitationPolicy::WeakPullOnly && r.supply == SupplyProfile::None;
   }
   return false;
 }
@@ -213,27 +221,55 @@ bool topologyEnabled(ProbeTopology t) {
                                          : PINDEX_POWERED_PROBING_ENABLED != 0;
 }
 
-// FourWirePowered needs a backend that reports the baseline plus the
-// driver's own needs. Nothing else (no config flag) can grant them.
-bool backendProvides(const DriverRequirements &r) {
-  if (r.topology != ProbeTopology::FourWirePowered) return true;
-  const uint16_t needed = kBackendFourWireBaseline | r.backendCapabilities;
-  return (fourWireBackendCapabilities() & needed) == needed;
+// How an attempt is powered.
+enum class PowerPath : uint8_t { None, Gpio, Backend, Unavailable };
+
+// kBackend* bit for a backend-supplied profile, else 0.
+uint16_t backendSupplyBit(SupplyProfile s) {
+  switch (s) {
+    case SupplyProfile::Backend5V: return kBackendSupply5V;
+    case SupplyProfile::Supply3V3: return kBackendSupply3V3;
+    case SupplyProfile::None:
+    case SupplyProfile::GpioLogic: break;
+  }
+  return 0;
+}
+
+// A protected backend is used only if it reports the baseline plus the
+// profile's own supply. The experimental GPIO profile is the fallback for
+// Supply3V3 alone, and only when its compile-time setting is 1; nothing
+// grants it Backend5V. No runtime observation (e.g. an address hint) can
+// change this.
+PowerPath powerPath(const DriverRequirements &r) {
+  switch (r.supply) {
+    case SupplyProfile::None: return PowerPath::None;
+    case SupplyProfile::GpioLogic: return PowerPath::Gpio;
+    case SupplyProfile::Backend5V:
+    case SupplyProfile::Supply3V3: {
+      const uint16_t needed = kBackendFourWireBaseline | backendSupplyBit(r.supply);
+      if ((fourWireBackendCapabilities() & needed) == needed) return PowerPath::Backend;
+      if (r.supply == SupplyProfile::Supply3V3 && PINDEX_I2C_GPIO_POWER_ENABLED) return PowerPath::Gpio;
+      break;
+    }
+  }
+  return PowerPath::Unavailable;
 }
 
 bool runnable(const DriverRequirements &r) {
-  return supported(r) && topologyEnabled(r.topology) && backendProvides(r);
+  return supported(r) && topologyEnabled(r.topology) && powerPath(r) != PowerPath::Unavailable;
 }
 
-// First enabled, supported driver that runnable() excludes for lack of
-// backend capabilities (reported as "hardware required"), or nullptr.
-const char *hardwareRequiredDriver() {
-  for (size_t i = 0; i < sensorDriverCount(); i++) {
-    const SensorDriver *d = sensorDriverAt(i);
-    const DriverRequirements &r = d->getRequirements();
-    if (supported(r) && topologyEnabled(r.topology) && !backendProvides(r)) return d->getName();
+// Bit i: registered driver i is enabled and supported but has no eligible
+// supply (reported as "hardware required"; it is skipped, never a fault).
+uint8_t hardwareRequiredMask() {
+  uint8_t mask = 0;
+  for (size_t i = 0; i < sensorDriverCount() && i < 8; i++) {
+    const DriverRequirements &r = sensorDriverAt(i)->getRequirements();
+    if (supported(r) && topologyEnabled(r.topology) && powerPath(r) == PowerPath::Unavailable) {
+      mask |= static_cast<uint8_t>(1u << i);
+    }
   }
-  return nullptr;
+  return mask;
 }
 
 size_t slotCount(ProbeTopology t) {
@@ -309,19 +345,23 @@ SensorDriver *currentDriver() {
 }
 
 // Powered drive is never applied across an observed coupled path. A driven
-// node must show no coupling to any other node (the unused one included):
-//   * VCC always (supply into a low-impedance path);
-//   * four-wire SIG1/SIG2 too: SIG1 is host-driven and SIG2 sensor-driven,
-//     so coupling to anything is contention. With GND the only undriven
-//     role, any coupling at all vetoes a four-wire mapping.
-// Three-wire DATA-GND coupling has no opposing strong drives (GND sinks;
-// DATA is only pulled up or sunk), as before. No coupling seen is NOT
-// permission: that comes from the protected interface, never the precheck.
-bool drivenPathsUncoupled(const ProbeMapping &m, uint8_t coupled) {
+// node must show no coupling to any other node (unused ones included):
+//   * VCC always: a coupled VCC path is a known or suspected low-impedance
+//     supply path (to GND or into a signal the host sinks), and a finite
+//     resistance cannot be told from a short here;
+//   * SIG1/SIG2 too unless the driver declares them open-drain: a
+//     push-pull signal (ultrasonic TRIG; ECHO is sensor-driven) coupled to
+//     anything is contention, so any coupling vetoes those mappings.
+// Open-drain signals (DHT DATA, I2C SDA/SCL) are only released or sunk and
+// GND only sinks, so couplings among them meet no opposing strong drive.
+// No coupling seen is NOT permission: that comes from the supply profile
+// and the protected interface, never from the precheck.
+bool drivenPathsUncoupled(const ProbeMapping &m, uint8_t coupled, bool openDrainSignals) {
   if (probeNodeWithRole(m, NodeRole::Vcc) < 0) return false;
   for (uint8_t n = 0; n < PROBE_NODE_COUNT; n++) {
     const NodeRole role = m.role[n];
-    if (role != NodeRole::Vcc && role != NodeRole::Sig1 && role != NodeRole::Sig2) continue;
+    const bool pushPullSignal = !openDrainSignals && (role == NodeRole::Sig1 || role == NodeRole::Sig2);
+    if (role != NodeRole::Vcc && !pushPullSignal) continue;
     for (uint8_t k = 0; k < PROBE_NODE_COUNT; k++) {
       if (k != n && (coupled & probePairBit(n, k)) != 0) return false;
     }
@@ -332,8 +372,9 @@ bool drivenPathsUncoupled(const ProbeMapping &m, uint8_t coupled) {
 // nullptr if the attempt may be prepared, else why not.
 const char *attemptBlockReason(const DriverRequirements &r, const ProbeMapping &m) {
   if (!supported(r) || r.topology != m.topology || !topologyEnabled(r.topology)) return "not-permitted";
-  if (!backendProvides(r)) return "hardware-required";
-  if (r.excitation == ExcitationPolicy::ProtectedActive && !drivenPathsUncoupled(m, status.coupledPairs)) {
+  if (powerPath(r) == PowerPath::Unavailable) return "hardware-required";
+  if (r.excitation == ExcitationPolicy::ProtectedActive &&
+      !drivenPathsUncoupled(m, status.coupledPairs, r.openDrainSignals)) {
     return "blocked-by-precheck";
   }
   return nullptr;  // WeakPullOnly: coupling is exactly what it measures
@@ -372,47 +413,70 @@ void driveNode(uint8_t node, uint8_t level) {
   pinMode(gpio(node), OUTPUT);
 }
 
-// ThreeWirePowered only; any other mapping leaves every node plain INPUT.
-// The fourth node stays plain INPUT.
-void powerUp(const ProbeMapping &m) {
+// GPIO power (three-wire, and the experimental four-wire I2C profile):
+// every node plain INPUT and the backend off first (break), then GND LOW so
+// VCC never rises without a return, then VCC HIGH, each latch written
+// before its output turns on. Three-wire DATA gets the pull-up; four-wire
+// signals and every unused node stay plain INPUT.
+void powerUpFromGpio(const ProbeMapping &m) {
   resetTestPins();
   const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
-  const int data = probeNodeWithRole(m, NodeRole::Data);
   const int gnd = probeNodeWithRole(m, NodeRole::Gnd);
-  if (m.topology != ProbeTopology::ThreeWirePowered || vcc < 0 || data < 0 || gnd < 0) return;
-  driveNode(static_cast<uint8_t>(gnd), LOW);  // GND first, so VCC never rises without a return
+  if (vcc < 0 || gnd < 0) return;
+  driveNode(static_cast<uint8_t>(gnd), LOW);
   driveNode(static_cast<uint8_t>(vcc), HIGH);
-  pinMode(gpio(static_cast<uint8_t>(data)), INPUT_PULLUP);
+  const int data = probeNodeWithRole(m, NodeRole::Data);
+  if (data >= 0) pinMode(gpio(static_cast<uint8_t>(data)), INPUT_PULLUP);
 }
 
-// Three-wire: DATA first (no pull-up or drive left to back-power the part
-// through its DATA pin), then VCC, then every node including GND.
-// Anything else: every node to plain INPUT. resetTestPins() then switches
-// the four-wire backend off, so a four-wire part loses its signals before
-// its supply and ground.
+// Signals first (DATA/SIG1/SIG2: no pull-up or drive left to back-power the
+// part), then VCC, then every node including GND to plain INPUT;
+// resetTestPins() then switches the four-wire backend off. The driver has
+// already released its own lines and peripherals (releaseAttempt()).
 void teardown(const ProbeMapping *m) {
-  if (m != nullptr && m->topology == ProbeTopology::ThreeWirePowered) {
-    const int data = probeNodeWithRole(*m, NodeRole::Data);
+  if (m != nullptr) {
+    for (uint8_t n = 0; n < PROBE_NODE_COUNT; n++) {
+      const NodeRole role = m->role[n];
+      if (role == NodeRole::Data || role == NodeRole::Sig1 || role == NodeRole::Sig2) pinMode(gpio(n), INPUT);
+    }
     const int vcc = probeNodeWithRole(*m, NodeRole::Vcc);
-    if (data >= 0) pinMode(gpio(static_cast<uint8_t>(data)), INPUT);
     if (vcc >= 0) pinMode(gpio(static_cast<uint8_t>(vcc)), INPUT);
   }
   resetTestPins();
 }
 
-// Three-wire ProtectedActive: GPIO power-up. Four-wire: every GPIO plain
-// INPUT and the backend off (break), then the backend routes this mapping
-// (make); false if it refuses. WeakPullOnly: every node plain INPUT; the
-// driver excites its pair itself (pull-up + open-drain LOW sink only).
+// Prepares the attempt's supply path. Backend: every GPIO plain INPUT and
+// the backend off (break), then the backend routes this mapping with the
+// profile's supply (make); false if it refuses. None: every node plain
+// INPUT; a weak-pull driver excites its pair itself.
 bool prepareExcitation(const DriverRequirements &r, const ProbeMapping &m) {
-  if (r.topology == ProbeTopology::ThreeWirePowered) {
-    powerUp(m);
-    return true;
+  switch (powerPath(r)) {
+    case PowerPath::Gpio:
+      powerUpFromGpio(m);
+      return true;
+    case PowerPath::Backend:
+      resetTestPins();
+      return fourWireBackendConnect(backendSupplyBit(r.supply), nodeWithRole(m, NodeRole::Vcc),
+                                    nodeWithRole(m, NodeRole::Sig1), nodeWithRole(m, NodeRole::Sig2),
+                                    nodeWithRole(m, NodeRole::Gnd));
+    case PowerPath::None:
+      resetTestPins();
+      return true;
+    case PowerPath::Unavailable:
+      break;
   }
   resetTestPins();
-  if (r.topology != ProbeTopology::FourWirePowered) return true;
-  return fourWireBackendConnect(nodeWithRole(m, NodeRole::Vcc), nodeWithRole(m, NodeRole::Sig1),
-                                nodeWithRole(m, NodeRole::Sig2), nodeWithRole(m, NodeRole::Gnd));
+  return false;
+}
+
+// Driver first: it releases its lines, interrupts and peripherals (e.g.
+// ends its I2C controller) while the attempt is still powered. Then supply
+// off and every node plain INPUT. False if the driver could not release
+// something it acquired: its ownership is uncertain.
+bool releaseAttempt(SensorDriver *driver, const ProbeMapping *m) {
+  if (driver != nullptr) driver->reset();
+  teardown(m);
+  return driver == nullptr || driver->resourcesReleased();
 }
 
 // ---- Result bookkeeping -----------------------------------------------------
@@ -451,8 +515,7 @@ void goIdle(uint32_t now, uint32_t delayMs) {
 }
 
 void enterFault(uint32_t now) {
-  resetTestPins();
-  if (SensorDriver *d = currentDriver()) d->reset();  // cancel anything in flight
+  releaseAttempt(currentDriver(), nullptr);  // cancel anything in flight, then every node INPUT
   clearResult();  // nothing is retried until a request
   enter(State::Fault, now);
 }
@@ -546,7 +609,7 @@ void startDiscovery(uint32_t now) {
   twoTerminalHits = 0;
   cycleMeasurementError = false;
   status.measurementUnavailable = false;
-  status.hardwareRequired = hardwareRequiredDriver();  // skipped, never a scan fault
+  status.hardwareRequiredMask = hardwareRequiredMask();  // skipped, never a scan fault
   if (attemptTotal() == 0) {  // nothing to try: never precheck or excite
     noComponent = true;
     goIdle(now, PROBE_RESCAN_INTERVAL_MS);
@@ -612,8 +675,11 @@ void onProbeSucceeded(SensorDriver *driver, uint32_t now) {
     // node is also coupled.
     twoTerminalHits++;
     twoTerminalHitIndex = attemptIndex;
-    teardown(currentMapping());
-    driver->reset();
+    if (!releaseAttempt(driver, currentMapping())) {
+      status.lastError = "release-failed";
+      enterFault(now);
+      return;
+    }
     advanceAttempt(now, true);
     return;
   }
@@ -640,9 +706,14 @@ void onSampleSucceeded(const char *line1, const char *line2, uint32_t now) {
 void onAttemptFailed(uint32_t now, const char *reason) {
   SensorDriver *driver = currentDriver();
   const bool measurementError = driver != nullptr && driver->failureIsMeasurementError();
-  teardown(currentMapping());       // pins safe first, immediately...
-  if (driver != nullptr) driver->reset();  // ...then cancel the driver's state
   status.lastError = reason;
+  if (!releaseAttempt(driver, currentMapping())) {
+    // Power is already off, but the driver could not release a peripheral
+    // it acquired. Never start another attempt with ownership uncertain.
+    status.lastError = "release-failed";
+    enterFault(now);
+    return;
+  }
 
   if (savedDriver == nullptr) {  // discovery: next attempt
     if (measurementError) cycleMeasurementError = true;
@@ -808,7 +879,7 @@ bool sameForDisplay(const ProbeStatus &a, const ProbeStatus &b) {
          a.consecutiveFailures == b.consecutiveFailures && sameText(a.lastError, b.lastError) &&
          a.precheck == b.precheck && a.coupledPairs == b.coupledPairs &&
          a.measurementUnavailable == b.measurementUnavailable &&
-         sameText(a.hardwareRequired, b.hardwareRequired);
+         a.hardwareRequiredMask == b.hardwareRequiredMask;
 }
 
 void publish(const ProbeStatus &before) {
@@ -865,7 +936,7 @@ void initProbeEngine() {
   noComponent = false;
   twoTerminalHits = 0;
   cycleMeasurementError = false;
-  status.hardwareRequired = hardwareRequiredDriver();
+  status.hardwareRequiredMask = hardwareRequiredMask();
 
   if (PINDEX_POWERED_PROBING_ENABLED || PINDEX_PASSIVE_PROBING_ENABLED) {
     goIdle(now, 0);  // discovery starts on the first tick
@@ -894,9 +965,12 @@ bool probeRequestRetry() {
 bool probeRequestClear() {
   if (state == State::Disabled) return false;
   const ProbeStatus before = status;
-  teardown(currentMapping());                         // pins safe first
-  if (SensorDriver *d = currentDriver()) d->reset();  // then cancel the driver
-  startDiscovery(millis());
+  if (releaseAttempt(currentDriver(), currentMapping())) {  // driver, then power and pins
+    startDiscovery(millis());
+  } else {
+    status.lastError = "release-failed";
+    enterFault(millis());
+  }
   publish(before);
   return true;
 }
@@ -904,6 +978,13 @@ bool probeRequestClear() {
 bool probeSendCommand(char command) {
   if (savedDriver == nullptr || !status.detected) return false;
   return savedDriver->handleUserCommand(command);
+}
+
+bool probeFormatDiagnostics(char *buf, size_t len) {
+  if (buf == nullptr || len == 0) return false;
+  buf[0] = '\0';
+  if (savedDriver == nullptr || !status.detected) return false;
+  return savedDriver->formatDiagnostics(buf, len);
 }
 
 void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLabel, char *first,

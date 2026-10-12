@@ -13,11 +13,13 @@
 // kBackend* bits (sensor_driver.h) that the hardware actually provides.
 uint16_t fourWireBackendCapabilities();
 
-// Routes supply to vccNode and ground to gndNode, with ESP32-safe signal
-// paths on sig1Node and sig2Node. The engine calls it only after
+// Routes `supply` (kBackendSupply5V or kBackendSupply3V3, one the backend
+// reports) to vccNode and ground to gndNode, with ESP32-safe signal paths
+// on sig1Node and sig2Node. The engine calls it only after
 // fourWireBackendDisconnect() and with every probe GPIO plain INPUT.
 // false = refused, nothing energised.
-bool fourWireBackendConnect(uint8_t vccNode, uint8_t sig1Node, uint8_t sig2Node, uint8_t gndNode);
+bool fourWireBackendConnect(uint16_t supply, uint8_t vccNode, uint8_t sig1Node, uint8_t sig2Node,
+                            uint8_t gndNode);
 
 // Supply off and every route open. Idempotent and safe at any time.
 void fourWireBackendDisconnect();

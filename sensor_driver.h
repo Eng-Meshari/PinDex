@@ -2,25 +2,30 @@
 //
 // Ownership: the probe engine owns pin permission, prechecks, which nodes
 // an attempt may use, power sequencing (GPIO VCC/GND for three-wire, the
-// protected backend for four-wire), teardown, scheduling, confirmation and
+// protected backend or the experimental GPIO profile for four-wire),
+// teardown, scheduling, confirmation and
 // removal policy. A driver owns only the signalling it needs on the nodes
 // handed to it in a ProbeContext: protocol timing, capture, decoding,
 // validation, its own sample storage and telemetry formatting. A driver
 // never powers VCC/GND, picks other nodes, touches the OLED or modifies
 // engine state.
 //
-// Capabilities (DriverRequirements::topology / ::excitation) decide how
-// the engine prepares an attempt; drivers are never selected by name:
-//   ThreeWirePowered + ProtectedActive: engine drives GND LOW, VCC HIGH and
-//     pulls DATA up (behind the protected interface) before probe(); the
-//     fourth node stays plain INPUT.
-//   FourWirePowered + ProtectedActive: every GPIO stays plain INPUT and the
-//     protected four-wire backend (four_wire_backend.h) routes supply and
-//     ground, only if it reports kBackendFourWireBaseline plus the driver's
-//     backendCapabilities. The driver signals on SIG1/SIG2 only.
-//   TwoTerminal + WeakPullOnly: engine powers nothing; every node is plain
-//     INPUT and the two unused nodes stay that way. The driver may only use
-//     an internal pull-up and an open-drain LOW sink on its two terminals.
+// Capabilities (DriverRequirements::topology / ::excitation / ::supply)
+// decide how the engine prepares an attempt; drivers are never selected by
+// name:
+//   ThreeWirePowered + ProtectedActive + GpioLogic: engine drives GND LOW,
+//     VCC HIGH and pulls DATA up (behind the protected interface) before
+//     probe(); the fourth node stays plain INPUT.
+//   FourWirePowered + ProtectedActive + Backend5V / Supply3V3: the
+//     protected four-wire backend (four_wire_backend.h) routes that supply
+//     and ground, only if it reports kBackendFourWireBaseline plus the
+//     supply's bit; every GPIO stays plain INPUT. Supply3V3 alone may
+//     instead use the experimental GPIO profile (GND LOW, VCC HIGH; off by
+//     default). The driver signals on SIG1/SIG2 only.
+//   TwoTerminal + WeakPullOnly + None: engine powers nothing; every node is
+//     plain INPUT and the two unused nodes stay that way. The driver may
+//     only use an internal pull-up and an open-drain LOW sink on its two
+//     terminals.
 //   Any other combination is unsupported and never attempted.
 //
 // Cooperative operations (probe() and readSample()):
@@ -37,7 +42,8 @@
 //   * readSample() needs a prior successful probe(); reset() forgets it.
 //   * Long waits return Pending. Only a short, bounded timing-critical
 //     capture may block (the DHT11 capture blocks at most 6.5 ms; the
-//     ultrasonic trigger pulse ~10 us, its echo is captured by interrupt).
+//     ultrasonic trigger pulse ~10 us, its echo is captured by interrupt;
+//     one synchronous I2C transaction per call, bounded by its timeout).
 //
 // readSample() buffers: maxLen is the capacity of EACH buffer including the
 // terminator. Null pointers or zero capacity are rejected without being
@@ -48,8 +54,11 @@
 // reset(): idempotent; cancels any pending operation and clears protocol,
 // binding, calibration and sample state. It may only make a pin safer
 // (e.g. release a line it is holding low or a pull-up it enabled, to plain
-// INPUT, or detach an interrupt it attached); it never energises a pin and
-// never touches another driver's pins.
+// INPUT, detach an interrupt it attached, or stop a bus peripheral it
+// started); it never energises a pin and never touches another driver's
+// pins. On teardown the engine calls it FIRST, while the attempt is still
+// powered, so signals and peripherals are released before the supply is
+// removed; then it removes power and restores every node to plain INPUT.
 #pragma once
 
 #include <stddef.h>
@@ -84,11 +93,24 @@ constexpr uint16_t kBackendGroundRouting = 1u << 2;         // return path route
 constexpr uint16_t kBackendSignalLevels = 1u << 3;          // no node can put more than 3.3 V on its GPIO
 constexpr uint16_t kBackendAssignmentProtection = 1u << 4;  // every wrong candidate mapping tolerated
 constexpr uint16_t kBackendBreakBeforeMake = 1u << 5;       // all routes open before a new mapping closes
+constexpr uint16_t kBackendSupply3V3 = 1u << 6;             // switched 3.3 V, current-limited, enough for the module
 
 // Every FourWirePowered attempt needs these, whatever the sensor.
 constexpr uint16_t kBackendFourWireBaseline = kBackendSupplySwitching | kBackendGroundRouting |
                                               kBackendSignalLevels | kBackendAssignmentProtection |
                                               kBackendBreakBeforeMake;
+
+// Where a powered attempt's supply comes from. The engine prepares power
+// from this; a driver never does. Three properties stay separate: 3.3 V
+// logic compatibility, whether the whole module accepts the supply's
+// voltage and current, and tolerance of wrong assignments while scanning.
+enum class SupplyProfile : uint8_t {
+  None,       // TwoTerminal: nothing is ever powered
+  GpioLogic,  // ThreeWirePowered: VCC HIGH / GND LOW from probe GPIOs (nominal 3.3 V logic level)
+  Backend5V,  // FourWirePowered: the protected backend's switched 5 V only; never GPIOs
+  Supply3V3,  // FourWirePowered: the protected backend's switched 3.3 V; without one, only the
+              // experimental bare-GPIO profile (PINDEX_I2C_GPIO_POWER_ENABLED, off by default)
+};
 
 // Fixed per driver; the engine prepares and schedules attempts from it.
 struct DriverRequirements {
@@ -98,7 +120,9 @@ struct DriverRequirements {
   uint32_t minAcquisitionIntervalMs;  // between operation starts, incl. retries
   uint32_t sampleIntervalMs;          // readSample() cadence (never below the minimum)
   uint32_t operationTimeoutMs;        // the engine fails an operation pending this long
-  uint16_t backendCapabilities;       // FourWirePowered: kBackend* bits needed beyond the baseline; else 0
+  SupplyProfile supply;               // must match the topology (see the engine's supported())
+  bool openDrainSignals;              // signal/DATA nodes are only released or sunk, never driven
+                                      // HIGH (a push-pull signal is vetoed on any coupling)
   const char *signalLabel[2];         // FourWirePowered: display names of SIG1, SIG2 (<= 3 chars); else nullptr
 };
 
@@ -117,10 +141,10 @@ struct TwoTerminalPins {
 };
 
 struct FourWirePins {
-  uint8_t vcc;   // supplied by the backend; this GPIO stays plain INPUT
-  uint8_t sig1;  // e.g. ultrasonic TRIG
-  uint8_t sig2;  // e.g. ultrasonic ECHO
-  uint8_t gnd;   // routed by the backend; this GPIO stays plain INPUT
+  uint8_t vcc;   // supplied by the engine (backend, or GPIO HIGH in the experimental profile)
+  uint8_t sig1;  // e.g. ultrasonic TRIG, I2C SDA
+  uint8_t sig2;  // e.g. ultrasonic ECHO, I2C SCL
+  uint8_t gnd;   // routed by the engine (backend, or GPIO LOW in the experimental profile)
 };
 
 struct ProbeContext {
@@ -158,6 +182,21 @@ class SensorDriver {
   // True if the latest failure means the measurement itself was unavailable
   // (e.g. ADC error) rather than "this part does not match".
   virtual bool failureIsMeasurementError() const { return false; }
+
+  // False if reset() could not release a peripheral it acquired (e.g. an
+  // I2C controller that refused to stop): ownership is uncertain, so the
+  // engine powers down and latches a fault instead of starting another
+  // attempt. Each later reset() tries the release once more.
+  virtual bool resourcesReleased() const { return true; }
+
+  // Optional diagnostic text built from cached results only (never a bus
+  // or pin operation), e.g. every address found. Terminated, bounded by
+  // len; false if there is nothing to report.
+  virtual bool formatDiagnostics(char *buf, size_t len) const {
+    (void)buf;
+    (void)len;
+    return false;
+  }
 
   // Optional user command for the detected driver (e.g. a guided
   // calibration step). Returns true if the driver accepted it.

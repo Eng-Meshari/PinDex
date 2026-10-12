@@ -33,7 +33,8 @@ const DriverRequirements kRequirements = {
     PASSIVE_SAMPLE_PERIOD_MS,        // minAcquisitionIntervalMs
     PASSIVE_SAMPLE_PERIOD_MS,        // sampleIntervalMs
     PASSIVE_OPERATION_TIMEOUT_MS,    // operationTimeoutMs
-    0,                               // backendCapabilities
+    SupplyProfile::None,             // supply: nothing is powered
+    true,                            // openDrainSignals: sink only, never HIGH
     {nullptr, nullptr},              // signalLabel
 };
 

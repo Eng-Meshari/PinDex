@@ -1,20 +1,23 @@
 // Host tests for PinDex. Not part of the Arduino build: the IDE compiles
 // only the sketch folder root and src/, never tests/.
-// Build from the PinDex folder with any C++17 host compiler, three ways:
+// Build from the PinDex folder with any C++17 host compiler, four ways
+// (POWERED / PASSIVE / I2C_GPIO_POWER):
 //   SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp
 //        src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp
-//        src/drivers/ultrasonic_driver.cpp"
+//        src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp"
 //   g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1
-//       -DPINDEX_PASSIVE_PROBING_ENABLED=1 $SRC -o build/test_all
-//   ...=0 / ...PASSIVE...=1 -> build/test_passive_only
-//   ...=0 / ...PASSIVE...=0 -> build/test_disabled
-// Run all three; each exits non-zero if any check fails. This file supplies
-// the driver registry, the passive ADC adapter and the four-wire backend
-// itself (link seams), so it is linked WITHOUT
-// src/drivers/driver_registry.cpp, src/drivers/passive_adc.cpp and
-// four_wire_backend.cpp. Shorts, resistors, faults, sensors and the
-// protected four-wire backend are simulated; nothing here touches
-// hardware, and no test drives opposing GPIO outputs into each other.
+//       -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=0 $SRC -o build/test_all
+//   1/1/1 -> build/test_i2c_gpio   (the experimental GPIO profile on)
+//   0/1/1 -> build/test_passive_only (powered off overrides the I2C profile)
+//   0/0/0 -> build/test_disabled
+// Run all four; each exits non-zero if any check fails. This file supplies
+// the driver registry, the passive ADC adapter, the four-wire backend and
+// the I2C bus adapter itself (link seams), so it is linked WITHOUT
+// src/drivers/driver_registry.cpp, src/drivers/passive_adc.cpp,
+// src/drivers/i2c_bus.cpp and four_wire_backend.cpp. Shorts, resistors,
+// faults, sensors, the I2C bus and the protected four-wire backend are
+// simulated; nothing here touches hardware, and no test drives opposing
+// GPIO outputs into each other.
 
 #include <math.h>
 #include <stdio.h>
@@ -31,6 +34,8 @@
 #include "sensor_driver.h"
 #include "src/drivers/dht11_driver.h"
 #include "src/drivers/driver_registry.h"
+#include "src/drivers/i2c_bus.h"
+#include "src/drivers/i2c_driver.h"
 #include "src/drivers/passive_adc.h"
 #include "src/drivers/passive_driver.h"
 #include "src/drivers/ultrasonic_driver.h"
@@ -70,6 +75,14 @@ static void useDrivers(SensorDriver *a = nullptr, SensorDriver *b = nullptr,
   for (SensorDriver *x : {a, b, c, d}) {
     if (x != nullptr) testDrivers[testDriverCount++] = x;
   }
+}
+
+// The engine reports this registered driver as skipped: no eligible supply.
+[[maybe_unused]] static bool needsHardware(const SensorDriver *d) {
+  for (size_t i = 0; i < testDriverCount; i++) {
+    if (testDrivers[i] == d) return (probeStatus().hardwareRequiredMask & (1u << i)) != 0;
+  }
+  return false;
 }
 
 // ---- Pure decoding ---------------------------------------------------------
@@ -284,6 +297,27 @@ static void testMappingText() {
   char s2[5];
   formatProbeMapping(PROBE_FOUR_WIRE_MAPPINGS[0], kLabels, s1, s2, sizeof s1);
   CHECK(same(s1, "A:VC") && same(s2, "C:EC"));
+
+  // I2C roles on all 24 four-wire mappings, generated from each mapping.
+  static const char *const kI2cLabels[2] = {"SDA", "SCL"};
+  for (const ProbeMapping &m : PROBE_FOUR_WIRE_MAPPINGS) {
+    const char *role[PROBE_NODE_COUNT];
+    for (int n = 0; n < PROBE_NODE_COUNT; n++) {
+      role[n] = m.role[n] == NodeRole::Vcc    ? "VCC"
+                : m.role[n] == NodeRole::Gnd  ? "GND"
+                : m.role[n] == NodeRole::Sig1 ? "SDA"
+                                              : "SCL";
+    }
+    char e1[PROBE_MAPPING_TEXT_LEN];
+    char e2[PROBE_MAPPING_TEXT_LEN];
+    snprintf(e1, sizeof e1, "A:%s B:%s", role[0], role[1]);
+    snprintf(e2, sizeof e2, "C:%s D:%s", role[2], role[3]);
+    formatProbeMapping(m, kI2cLabels, a, b, sizeof a);
+    CHECK(same(a, e1) && same(b, e2));
+    CHECK(strlen(a) * 6 <= OLED_WIDTH && strlen(b) * 6 <= OLED_WIDTH);
+  }
+  formatProbeMapping(PROBE_FOUR_WIRE_MAPPINGS[3], kI2cLabels, a, b, sizeof a);
+  CHECK(same(a, "A:VCC B:GND") && same(b, "C:SDA D:SCL"));  // the README example
 }
 
 static void testPassiveEstimate() {
@@ -304,6 +338,8 @@ static int lockedPinModes = 0;
 static int highDriveEvents = 0;  // any probe pin driven HIGH (push-pull)
 static int adcReadsInCritical = 0;
 static int adcWithIsrAttached = 0;  // passive sensing began with a probe interrupt still attached
+static int adcWithI2cRunning = 0;   // passive sensing began with the probe I2C controller running
+static bool i2cControllerRunning();  // simulated bus (below)
 static bool flakyA = false;  // A alternates HIGH/LOW while pulled up
 static int flakyReads = 0;
 
@@ -540,6 +576,7 @@ static int senseCount = 0;
 PassiveAdcStatus passiveAdcBeginSense(uint8_t pin) {
   if (senseCount < 128) senseLog[senseCount++] = pin;
   if (anyProbeIsrAttached()) adcWithIsrAttached++;  // an ultrasonic interrupt was not released
+  if (i2cControllerRunning()) adcWithI2cRunning++;  // the I2C controller was not stopped
   if (net.adcUnavailable) return PassiveAdcStatus::Unavailable;
   if (net.adcBeginFails) return PassiveAdcStatus::ConfigFailed;
   mock::pins[pin].mode = ANALOG | PULLUP;  // analog pad, pull-up re-enabled after setup
@@ -635,12 +672,13 @@ static int responseLevel(uint64_t t) {
 // path can be exercised. caps = 0 behaves like the shipped backend
 // (nothing provided); a test must grant capabilities explicitly.
 
-constexpr uint16_t kAllBackendCaps = kBackendFourWireBaseline | kBackendSupply5V;
+constexpr uint16_t kAllBackendCaps = kBackendFourWireBaseline | kBackendSupply5V | kBackendSupply3V3;
 
 struct FakeBackend {
   uint16_t caps = 0;
   bool refuse = false;     // the interface declines to route (e.g. its own fault)
   bool connected = false;
+  uint16_t supply = 0;     // kBackendSupply5V / kBackendSupply3V3 while connected
   int vcc = -1;            // routed nodes while connected
   int sig1 = -1;
   int sig2 = -1;
@@ -648,21 +686,25 @@ struct FakeBackend {
   uint64_t connectedAtUs = 0;
   int requests = 0;        // connect calls
   int connects = 0;        // accepted connections
+  uint8_t vccNodesUsed = 0;   // bit n: node n was ever given the supply
+  uint16_t supplyLog[128] = {};  // supply of each accepted connection, in order
   int violations = 0;      // connect while connected (no break), with a probe GPIO
                            // not plain INPUT or an interrupt attached, repeated or
-                           // invalid nodes, or without the baseline capabilities
+                           // invalid nodes, without the baseline capabilities, or
+                           // with a supply the backend does not report
   int signalsDrivenAtOff = 0;  // supply removed while a probe GPIO was still an output
 };
 static FakeBackend backend;
 
 static void sonarPowerLost();
+static void supplyRemoved();
 
 uint16_t fourWireBackendCapabilities() { return backend.caps; }
 
-bool fourWireBackendConnect(uint8_t vcc, uint8_t sig1, uint8_t sig2, uint8_t gnd) {
+bool fourWireBackendConnect(uint16_t supply, uint8_t vcc, uint8_t sig1, uint8_t sig2, uint8_t gnd) {
   backend.requests++;
   const uint8_t nodes[4] = {vcc, sig1, sig2, gnd};
-  bool valid = true;
+  bool valid = supply == kBackendSupply5V || supply == kBackendSupply3V3;
   for (int i = 0; i < 4; i++) {
     if (nodes[i] >= PROBE_NODE_COUNT) valid = false;
     for (int j = 0; j < i; j++) {
@@ -670,16 +712,19 @@ bool fourWireBackendConnect(uint8_t vcc, uint8_t sig1, uint8_t sig2, uint8_t gnd
     }
   }
   if (backend.connected || !allProbesPlainInput() || anyProbeIsrAttached() || !valid ||
-      (backend.caps & kBackendFourWireBaseline) != kBackendFourWireBaseline) {
+      (backend.caps & (kBackendFourWireBaseline | supply)) != (kBackendFourWireBaseline | supply)) {
     backend.violations++;
   }
   if (backend.refuse) return false;
   backend.connected = true;
+  backend.supply = supply;
   backend.vcc = vcc;
   backend.sig1 = sig1;
   backend.sig2 = sig2;
   backend.gnd = gnd;
+  if (backend.connects < 128) backend.supplyLog[backend.connects] = supply;
   backend.connects++;
+  if (vcc < PROBE_NODE_COUNT) backend.vccNodesUsed |= static_cast<uint8_t>(1u << vcc);
   backend.connectedAtUs = mock::nowUs;
   return true;
 }
@@ -692,7 +737,9 @@ void fourWireBackendDisconnect() {
       break;
     }
   }
+  supplyRemoved();  // checked while the routes are still recorded
   backend.connected = false;
+  backend.supply = 0;
   backend.vcc = backend.sig1 = backend.sig2 = backend.gnd = -1;
   sonarPowerLost();
 }
@@ -730,8 +777,8 @@ static uint8_t sonarGpio(NodeRole role) {
 
 static bool sonarPowered() {
   const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[sonar.wiring];
-  return sonar.attached && backend.connected && backend.vcc == probeNodeWithRole(m, NodeRole::Vcc) &&
-         backend.gnd == probeNodeWithRole(m, NodeRole::Gnd);
+  return sonar.attached && backend.connected && backend.supply == kBackendSupply5V &&
+         backend.vcc == probeNodeWithRole(m, NodeRole::Vcc) && backend.gnd == probeNodeWithRole(m, NodeRole::Gnd);
 }
 
 // Moves ECHO and reports the edge to whatever ISR is attached to it.
@@ -767,7 +814,10 @@ static void sonarOnTrig() {
   sonar.fallAtUs = sonar.riseAtUs + sonar.widthUs;
 }
 
+static uint64_t simTick = 0;  // advanceTo() calls: one per simulated loop() pass
+
 static void advanceTo(uint64_t untilUs) {
+  simTick++;
   for (;;) {
     const uint64_t next = sonar.riseAtUs != 0 ? sonar.riseAtUs : sonar.fallAtUs;
     if (next == 0 || next > untilUs) break;
@@ -783,10 +833,147 @@ static void advanceTo(uint64_t untilUs) {
   if (untilUs > mock::nowUs) mock::nowUs = untilUs;
 }
 
+// ---- Simulated I2C module and fake probe bus (replaces src/drivers/i2c_bus.cpp)
+// One controller, as on the ESP32 (Wire1). The module answers only while
+// its own VCC and GND are powered (backend 3.3 V, or GPIO HIGH/LOW in the
+// experimental profile) and the controller runs on its own SDA/SCL nodes.
+
+struct SimI2c {
+  // The module.
+  bool attached = false;
+  int wiring = 3;               // PROBE_FOUR_WIRE_MAPPINGS index: A VCC, C SDA, D SCL, B GND
+  I2cAddressSet acks = {};      // addresses that acknowledge
+  I2cAddressSet altAcks = {};   // answered instead during "unstable" sweeps
+  int altSweeps = 0;            // the first n sweeps (112 transactions each) answer altAcks
+  bool alternate = false;       // every odd sweep answers altAcks (never settles)
+  bool sdaLow = false;          // a line held LOW on the module's own bus
+  bool sclLow = false;
+  int stuckAfter = -1;          // SDA held LOW once this many transactions have run
+  int timeoutAt = -1;           // this transaction (0-based) times out
+  int errorAt = -1;             // this transaction fails as a bus error
+  // The controller.
+  bool conflict = false;        // already running for another module
+  bool beginFails = false;
+  bool endFails = false;
+  bool running = false;
+  uint8_t sda = 0xFF;
+  uint8_t scl = 0xFF;
+  int begins = 0;
+  int ends = 0;
+  int transactions = 0;
+  uint8_t log[1024] = {};       // address of each transaction, in order
+  uint64_t lastTick = UINT64_MAX;
+  uint64_t beganAtUs = 0;
+  int violations = 0;           // begin with SDA/SCL not plain INPUT, two transactions in
+                                // one loop pass, or a transaction inside a critical section
+  int powerOffWhileRunning = 0;  // supply removed while the controller still ran
+};
+static SimI2c i2cSim;
+static I2cDriver i2c;  // production driver, registered per test
+static bool wasDrivingHigh[64];
+
+static void setAcks(I2cAddressSet &s, std::initializer_list<uint8_t> addresses) {
+  s = I2cAddressSet{};
+  for (uint8_t a : addresses) {
+    s.bits[a >> 5] |= 1u << (a & 31);
+    s.count++;
+  }
+}
+
+static bool hasAck(const I2cAddressSet &s, uint8_t a) { return ((s.bits[a >> 5] >> (a & 31)) & 1u) != 0; }
+
+static uint8_t i2cModuleGpio(NodeRole role) {
+  return gpioOf(probeNodeWithRole(PROBE_FOUR_WIRE_MAPPINGS[i2cSim.wiring], role));
+}
+
+static bool i2cModulePowered() {
+  if (!i2cSim.attached) return false;
+  const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[i2cSim.wiring];
+  const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
+  const int gnd = probeNodeWithRole(m, NodeRole::Gnd);
+  const bool viaBackend = backend.connected && backend.supply == kBackendSupply3V3 && backend.vcc == vcc &&
+                          backend.gnd == gnd;
+  return viaBackend || (mock::drivesHigh(gpioOf(vcc)) && mock::drivesLow(gpioOf(gnd)));
+}
+
+static bool onModuleBus() {
+  return i2cSim.attached && i2cSim.running && i2cSim.sda == i2cModuleGpio(NodeRole::Sig1) &&
+         i2cSim.scl == i2cModuleGpio(NodeRole::Sig2);
+}
+
+static bool moduleLinesLow() {
+  const bool stuck = i2cSim.stuckAfter >= 0 && i2cSim.transactions >= i2cSim.stuckAfter;
+  return onModuleBus() && (i2cSim.sdaLow || i2cSim.sclLow || stuck);
+}
+
+// Supply leaving the module side: backend off, or a VCC GPIO stops driving.
+static void supplyRemoved() {
+  if (i2cSim.running) i2cSim.powerOffWhileRunning++;
+}
+
+I2cBusStart i2cBusBegin(uint8_t sda, uint8_t scl) {
+  i2cSim.begins++;
+  if (i2cSim.conflict || i2cSim.running) return I2cBusStart::Conflict;
+  if (mock::pins[sda].mode != INPUT || mock::pins[scl].mode != INPUT) i2cSim.violations++;
+  if (i2cSim.beginFails) {  // a partial start, released again
+    pinMode(sda, INPUT);
+    pinMode(scl, INPUT);
+    return I2cBusStart::Failed;
+  }
+  i2cSim.running = true;
+  i2cSim.beganAtUs = mock::nowUs;
+  i2cSim.sda = sda;
+  i2cSim.scl = scl;
+  for (uint8_t pin : {sda, scl}) {  // open-drain, released, internal pull-up on
+    digitalWrite(pin, HIGH);
+    pinMode(pin, OUTPUT_OPEN_DRAIN | PULLUP);
+  }
+  return I2cBusStart::Ok;
+}
+
+bool i2cBusIdle() { return i2cSim.running && !moduleLinesLow(); }
+
+static bool i2cControllerRunning() { return i2cSim.running; }
+
+I2cBusResult i2cBusProbe(uint8_t address) {
+  if (mock::criticalDepth != 0) i2cSim.violations++;
+  if (simTick == i2cSim.lastTick) i2cSim.violations++;  // two transactions in one loop pass
+  i2cSim.lastTick = simTick;
+  if (!i2cSim.running) return I2cBusResult::BusError;
+  const bool linesLow = moduleLinesLow();  // as the transaction starts
+  const int index = i2cSim.transactions++;
+  if (index < 1024) i2cSim.log[index] = address;
+  mock::nowUs += 100;  // one address byte at 100 kHz plus overhead
+  if (index == i2cSim.timeoutAt || linesLow) return I2cBusResult::Timeout;
+  if (index == i2cSim.errorAt) return I2cBusResult::BusError;
+  if (!onModuleBus() || !i2cModulePowered()) return I2cBusResult::Nack;
+  const int sweep = index / (I2C_LAST_ADDRESS - I2C_FIRST_ADDRESS + 1);
+  const bool alt = sweep < i2cSim.altSweeps || (i2cSim.alternate && sweep % 2 == 1);
+  return hasAck(alt ? i2cSim.altAcks : i2cSim.acks, address) ? I2cBusResult::Ack : I2cBusResult::Nack;
+}
+
+bool i2cBusEnd() {
+  i2cSim.ends++;
+  if (i2cSim.running) {
+    if (i2cSim.endFails) return false;  // still running: ownership uncertain
+    i2cSim.running = false;
+  }
+  if (i2cSim.sda != 0xFF) {
+    pinMode(i2cSim.sda, INPUT);  // pulls off, plain digital input
+    pinMode(i2cSim.scl, INPUT);
+    i2cSim.sda = i2cSim.scl = 0xFF;
+  }
+  return true;
+}
+
 // Called after every pinMode()/digitalWrite().
 static void onPinChange(uint8_t pin, bool isPinMode) {
   if (isPinMode && mock::criticalDepth != 0) lockedPinModes++;
   if (nodeOf(pin) >= 0 && mock::drivesHigh(pin)) highDriveEvents++;
+  if (pin < 64) {
+    if (wasDrivingHigh[pin] && !mock::drivesHigh(pin)) supplyRemoved();
+    wasDrivingHigh[pin] = mock::drivesHigh(pin);
+  }
   if (sonar.attached && pin == sonarGpio(NodeRole::Sig1)) sonarOnTrig();
   if (!sensor.attached) return;
 
@@ -836,8 +1023,10 @@ static void resetWorld(uint64_t startUs = 1000000ULL, uint16_t backendCaps = 0) 
   mock::reset(startUs);
   sensor = SimSensor();
   sonar = SimSonar();
+  i2cSim = SimI2c();
   backend = FakeBackend();
   backend.caps = backendCaps;
+  memset(wasDrivingHigh, 0, sizeof wasDrivingHigh);
   netReset();
   flakyA = false;
   flakyReads = 0;
@@ -865,9 +1054,23 @@ static void resetWorld(uint64_t startUs = 1000000ULL, uint16_t backendCaps = 0) 
 
 class FakeDriver final : public SensorDriver {
  public:
+  // Supply follows the topology: GPIO three-wire, backend 5 V four-wire
+  // (push-pull signals), nothing for two-terminal. Tests may change req.
   FakeDriver(int id, const char *name, ProbeTopology topology = ProbeTopology::ThreeWirePowered,
              ExcitationPolicy excitation = ExcitationPolicy::ProtectedActive)
-      : req{topology, excitation, 300, 500, 700, 1000, 0, {nullptr, nullptr}}, id_(id), name_(name) {}
+      : req{topology,
+            excitation,
+            300,
+            500,
+            700,
+            1000,
+            topology == ProbeTopology::ThreeWirePowered  ? SupplyProfile::GpioLogic
+            : topology == ProbeTopology::FourWirePowered ? SupplyProfile::Backend5V
+                                                         : SupplyProfile::None,
+            false,
+            {nullptr, nullptr}},
+        id_(id),
+        name_(name) {}
 
   DriverRequirements req;
   int pendingCalls = 0;  // Pending results before each operation completes
@@ -878,9 +1081,11 @@ class FakeDriver final : public SensorDriver {
   int sampleStarts = 0;
   int calls = 0;
   int resets = 0;
-  int unsafeResets = 0;     // reset() while a probe pin was not plain INPUT
+  int resetsAfterPowerOff = 0;  // reset() of a powered attempt whose supply was already gone:
+                                // the engine must release the driver before removing power
   int unpoweredStarts = 0;  // powered operation started without exactly its mapping powered
-                            // (three-wire: VCC/GND GPIOs; four-wire: backend routes, GPIOs INPUT)
+                            // (three-wire: VCC/GND GPIOs; four-wire: backend routes with every
+                            // GPIO INPUT, or experimental GPIO VCC/GND with the signals INPUT)
   int energisedStarts = 0;  // two-terminal operation started with a probe pin not plain INPUT
 
   const char *getName() const override { return name_; }
@@ -940,26 +1145,40 @@ class FakeDriver final : public SensorDriver {
 
   void reset() override {
     resets++;
-    if (!allProbesPlainInput()) unsafeResets++;
+    if (poweredOp_ && !viaBackend() && !viaGpio()) resetsAfterPowerOff++;
+    poweredOp_ = false;
     status_ = DriverOperationStatus::Idle;
     bound_ = false;
     remaining_ = 0;
   }
 
  private:
+  bool viaBackend() const {
+    const FourWirePins &p = context_.fourWire;
+    return req.topology == ProbeTopology::FourWirePowered && backend.connected &&
+           gpioOf(backend.vcc) == p.vcc && gpioOf(backend.sig1) == p.sig1 && gpioOf(backend.sig2) == p.sig2 &&
+           gpioOf(backend.gnd) == p.gnd;
+  }
+
+  bool viaGpio() const {
+    if (req.topology == ProbeTopology::ThreeWirePowered) {
+      return mock::drivesHigh(context_.powered.vcc) && mock::drivesLow(context_.powered.gnd);
+    }
+    return req.topology == ProbeTopology::FourWirePowered && mock::drivesHigh(context_.fourWire.vcc) &&
+           mock::drivesLow(context_.fourWire.gnd);
+  }
+
   void start(bool sample) {
     status_ = DriverOperationStatus::Pending;
     remaining_ = pendingCalls;
+    poweredOp_ = req.topology != ProbeTopology::TwoTerminal;
     if (req.topology == ProbeTopology::ThreeWirePowered) {
-      if (!(mock::drivesHigh(context_.powered.vcc) && mock::drivesLow(context_.powered.gnd))) {
-        unpoweredStarts++;
-      }
+      if (!viaGpio()) unpoweredStarts++;
     } else if (req.topology == ProbeTopology::FourWirePowered) {
       const FourWirePins &p = context_.fourWire;
-      const bool routed = backend.connected && gpioOf(backend.vcc) == p.vcc &&
-                          gpioOf(backend.sig1) == p.sig1 && gpioOf(backend.sig2) == p.sig2 &&
-                          gpioOf(backend.gnd) == p.gnd;
-      if (!routed || !allProbesPlainInput()) unpoweredStarts++;
+      const bool ok = viaBackend() ? allProbesPlainInput()
+                                   : viaGpio() && !mock::isOutput(p.sig1) && !mock::isOutput(p.sig2);
+      if (!ok) unpoweredStarts++;
     } else if (!allProbesPlainInput()) {
       energisedStarts++;
     }
@@ -971,6 +1190,7 @@ class FakeDriver final : public SensorDriver {
   DriverOperationStatus status_ = DriverOperationStatus::Idle;
   ProbeContext context_{};
   bool bound_ = false;
+  bool poweredOp_ = false;  // a powered operation started since the last reset()
   int remaining_ = 0;
   int slot_ = -1;
 };
@@ -1400,7 +1620,7 @@ static void testPassiveToDhtHandoff() {
 static void powerSonarByHand() {
   resetTestPins();
   const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[sonar.wiring];
-  CHECK(fourWireBackendConnect(static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Vcc)),
+  CHECK(fourWireBackendConnect(kBackendSupply5V, static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Vcc)),
                                static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Sig1)),
                                static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Sig2)),
                                static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Gnd))));
@@ -1488,7 +1708,7 @@ static void testUltrasonicDriverContract() {
   const DriverRequirements &r = d.getRequirements();
   CHECK(same(d.getName(), "HC-SR04 Ultrasonic"));
   CHECK(r.topology == ProbeTopology::FourWirePowered && r.excitation == ExcitationPolicy::ProtectedActive);
-  CHECK((r.backendCapabilities & kBackendSupply5V) != 0);  // a 5 V module, never GPIO-powered
+  CHECK(r.supply == SupplyProfile::Backend5V && !r.openDrainSignals);  // 5 V, never GPIO; TRIG push-pull
   CHECK(same(r.signalLabel[0], "TRG") && same(r.signalLabel[1], "ECH"));
   CHECK(r.powerStabilizeMs == ULTRASONIC_POWER_STABILIZE_MS && r.minAcquisitionIntervalMs >= 70);
   CHECK(r.sampleIntervalMs >= r.minAcquisitionIntervalMs);
@@ -1670,6 +1890,311 @@ static void testUltrasonicHandoff() {
   resetTestPins();
 }
 
+// ---- I2C scanner, driven directly (every build) ----------------------------
+
+constexpr int kSweepLength = I2C_LAST_ADDRESS - I2C_FIRST_ADDRESS + 1;  // 112
+
+// Routes the simulated module's own mapping through the fake backend's
+// 3.3 V supply, as the engine would (the engine's job, done manually).
+static void powerI2cByHand() {
+  resetTestPins();
+  const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[i2cSim.wiring];
+  CHECK(fourWireBackendConnect(kBackendSupply3V3, static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Vcc)),
+                               static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Sig1)),
+                               static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Sig2)),
+                               static_cast<uint8_t>(probeNodeWithRole(m, NodeRole::Gnd))));
+}
+
+// A fresh world with the module on mapping 4 (A VCC, C SDA, D SCL, B GND)
+// answering `addresses`, powered through the backend's 3.3 V.
+static void i2cWorld(std::initializer_list<uint8_t> addresses, uint64_t startUs = 1000000ULL) {
+  useDrivers();  // the engine stays idle; these tests drive the driver
+  resetWorld(startUs, kAllBackendCaps);
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, addresses);
+  powerI2cByHand();
+}
+
+static void testI2cHintsAndCodes() {
+  I2cDriver d;
+  const DriverRequirements &r = d.getRequirements();
+  CHECK(same(d.getName(), "I2C Device"));
+  CHECK(r.topology == ProbeTopology::FourWirePowered && r.excitation == ExcitationPolicy::ProtectedActive);
+  CHECK(r.supply == SupplyProfile::Supply3V3 && r.openDrainSignals);  // never the 5 V profile
+  CHECK(same(r.signalLabel[0], "SDA") && same(r.signalLabel[1], "SCL"));
+  CHECK(r.powerStabilizeMs == I2C_POWER_STABILIZE_MS && r.sampleIntervalMs == I2C_SAMPLE_INTERVAL_MS);
+  CHECK(r.operationTimeoutMs > I2C_MAX_SWEEPS * I2C_SWEEP_DEADLINE_MS);
+
+  // Candidate hints: common, non-exclusive, always tentative.
+  CHECK(same(i2cAddressHint(0x68), "MPU6050 / DS3231?") && same(i2cAddressHint(0x69), "MPU6050 / IMU?"));
+  CHECK(same(i2cAddressHint(0x76), "BMP280 / BME280?") && same(i2cAddressHint(0x77), "BMP280 / BME280?"));
+  CHECK(same(i2cAddressHint(0x27), "PCF8574 / LCD?") && same(i2cAddressHint(0x3F), "PCF8574A / LCD?"));
+  CHECK(same(i2cAddressHint(0x3C), "SSD1306 / OLED?") && same(i2cAddressHint(0x3D), "SSD1306 / OLED?"));
+  CHECK(same(i2cAddressHint(0x23), "BH1750?") && same(i2cAddressHint(0x48), "ADS1115 / Other?"));
+  for (unsigned a = 0x50; a <= 0x57; a++) CHECK(same(i2cAddressHint(static_cast<uint8_t>(a)), "AT24Cxx / EEPROM?"));
+  for (uint8_t a : {0x08, 0x10, 0x3E, 0x4F, 0x58, 0x6A, 0x75}) CHECK(same(i2cAddressHint(a), "Unknown model"));
+  for (unsigned a = I2C_FIRST_ADDRESS; a <= I2C_LAST_ADDRESS; a++) {
+    const char *hint = i2cAddressHint(static_cast<uint8_t>(a));
+    const size_t n = strlen(hint);
+    CHECK(n > 0 && n * 6 <= OLED_WIDTH);  // one OLED line
+    CHECK(hint[n - 1] == '?' || same(hint, "Unknown model"));
+  }
+
+  // endTransmission() codes: only 2 is an ordinary miss; 4/5 and the
+  // payload-only codes are never a clean NACK.
+  CHECK(i2cBusResultFromWire(0) == I2cBusResult::Ack);
+  CHECK(i2cBusResultFromWire(2) == I2cBusResult::Nack);
+  CHECK(i2cBusResultFromWire(5) == I2cBusResult::Timeout);
+  for (uint8_t code : {1, 3, 4, 6, 255}) CHECK(i2cBusResultFromWire(code) == I2cBusResult::BusError);
+}
+
+static int i2cFailureTx = 0;        // transactions issued by the probe in i2cProbeFailure()
+static uint32_t i2cFailureMs = 0;   // how long it took to finish
+
+// A fresh world and driver; `setup` adjusts the simulation, then one probe()
+// runs. Returns its failure reason (nullptr on success) and checks that a
+// failure left no controller running and no rule broken.
+static const char *i2cProbeFailure(std::initializer_list<uint8_t> addresses, void (*setup)()) {
+  i2cWorld(addresses);
+  setup();
+  I2cDriver d;
+  const uint64_t startUs = mock::nowUs;
+  const bool ok = driveProbe(d, fourWireContext(3));
+  i2cFailureTx = i2cSim.transactions;
+  i2cFailureMs = static_cast<uint32_t>((mock::nowUs - startUs) / 1000);
+  const char *reason = ok ? nullptr : d.getFailureReason();
+  if (!ok) {
+    CHECK(d.getOperationStatus() == DriverOperationStatus::Failed);
+    CHECK(!i2cSim.running && d.resourcesReleased());
+    CHECK(mock::pins[gpioOf(2)].mode == INPUT && mock::pins[gpioOf(3)].mode == INPUT);
+  }
+  CHECK(i2cSim.violations == 0);
+  d.reset();
+  return reason;
+}
+
+static void testI2cDriverContract() {
+  i2cWorld({0x68});
+  I2cDriver d;
+  char l1[PROBE_TELEMETRY_TEXT_LEN];
+  char l2[PROBE_TELEMETRY_TEXT_LEN];
+  char diag[128];
+  const ProbeContext ctx = fourWireContext(3);
+  const uint8_t sda = ctx.fourWire.sig1, scl = ctx.fourWire.sig2;
+
+  // Wrong topology and bad buffers: refused without touching a pin or the bus.
+  size_t quiet = mock::eventCount;
+  CHECK(!d.probe(poweredContext(0)) && same(d.getFailureReason(), "topology-mismatch"));
+  CHECK(!d.readSample(nullptr, l2, sizeof l2) && same(d.getFailureReason(), "invalid-buffer"));
+  memset(l1, 'x', sizeof l1);
+  CHECK(!d.readSample(l1, l2, 0) && l1[0] == 'x');
+  CHECK(!d.readSample(l1, l2, sizeof l1) && same(d.getFailureReason(), "not-probed"));
+  CHECK(l1[0] == '\0' && l2[0] == '\0');
+  CHECK(!d.formatDiagnostics(diag, sizeof diag) && diag[0] == '\0');
+  CHECK(mock::eventCount == quiet && i2cSim.begins == 0 && i2cSim.ends == 0);
+
+  // probe(): the controller starts on SDA = SIG1 and SCL = SIG2
+  // (open-drain, never push-pull HIGH), then two full sweeps of exactly
+  // 0x08-0x77 in order, one address per call, Pending throughout. The
+  // VCC and GND GPIOs are never touched.
+  int calls = 0;
+  bool ok = false;
+  while (calls < 1000) {
+    calls++;
+    if (d.probe(ctx)) {
+      ok = true;
+      break;
+    }
+    if (d.getOperationStatus() != DriverOperationStatus::Pending) break;
+    advanceTo(mock::nowUs + 1000);
+  }
+  CHECK(ok && calls > 2 * kSweepLength);
+  CHECK(i2cSim.begins == 1 && i2cSim.running && i2cSim.sda == sda && i2cSim.scl == scl);
+  CHECK(i2cSim.transactions == 2 * kSweepLength);
+  for (int i = 0; i < 2 * kSweepLength; i++) CHECK(i2cSim.log[i] == I2C_FIRST_ADDRESS + i % kSweepLength);
+  CHECK(i2cSim.violations == 0);  // one transaction per call, never inside a critical section
+  CHECK((mock::pins[sda].mode & OPEN_DRAIN) && (mock::pins[scl].mode & OPEN_DRAIN));
+  CHECK(!mock::drivesHigh(sda) && !mock::drivesHigh(scl));
+  CHECK(mock::pins[ctx.fourWire.vcc].mode == INPUT && mock::pins[ctx.fourWire.gnd].mode == INPUT);
+  CHECK(mock::criticalDepth == 0);
+
+  // readSample(): one liveness transaction to a confirmed address, accepted
+  // once the lines are idle again. No measurement is invented.
+  int tx = i2cSim.transactions;
+  CHECK(driveSample(d, l1, l2, sizeof l1));
+  CHECK(same(l1, "Addr: 0x68 (ACK)") && same(l2, "MPU6050 / DS3231?"));
+  CHECK(i2cSim.transactions == tx + 1 && i2cSim.log[tx] == 0x68);
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && same(diag, "I2C ACK (1): 0x68"));
+  char tiny[6];
+  CHECK(d.formatDiagnostics(tiny, sizeof tiny) && same(tiny, "I2C A"));
+  char s1[6];
+  char s2[6];
+  CHECK(driveSample(d, s1, s2, sizeof s1) && same(s1, "Addr:") && same(s2, "MPU60"));
+
+  // reset(): stops the controller first (pins plain INPUT, pulls off);
+  // repeated resets touch nothing; the session's results are gone.
+  d.reset();
+  CHECK(!i2cSim.running && d.resourcesReleased());
+  CHECK(mock::pins[sda].mode == INPUT && mock::pins[scl].mode == INPUT);
+  quiet = mock::eventCount;
+  const int ends = i2cSim.ends;
+  d.reset();
+  d.reset();
+  CHECK(mock::eventCount == quiet && i2cSim.ends == ends);
+  CHECK(!d.readSample(l1, l2, sizeof l1) && same(d.getFailureReason(), "not-probed"));
+  CHECK(!d.formatDiagnostics(diag, sizeof diag));
+
+  // Cancellation mid-sweep: the sweep stops at once.
+  for (int i = 0; i < 20; i++) {
+    d.probe(ctx);
+    advanceTo(mock::nowUs + 1000);
+  }
+  CHECK(i2cSim.running && d.getOperationStatus() == DriverOperationStatus::Pending);
+  tx = i2cSim.transactions;
+  d.reset();
+  CHECK(!i2cSim.running);
+  advanceTo(mock::nowUs + 100000);
+  CHECK(i2cSim.transactions == tx);
+
+  // A larger set is kept whole; samples rotate through it in address order,
+  // one liveness transaction each, and wrap. Unknown addresses are valid
+  // discoveries. (One module may answer at several addresses.)
+  setAcks(i2cSim.acks, {0x10, 0x3C, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x76});
+  CHECK(driveProbe(d, ctx));
+  CHECK(d.formatDiagnostics(diag, sizeof diag));
+  CHECK(same(diag, "I2C ACK (11): 0x10 0x3C 0x50 0x51 0x52 0x53 0x54 0x55 0x56 0x57 0x76"));
+  const char *const line1[] = {"Addr 1/11: 0x10 ACK", "Addr 2/11: 0x3C ACK", "Addr 3/11: 0x50 ACK"};
+  const char *const line2[] = {"Unknown model", "SSD1306 / OLED?", "AT24Cxx / EEPROM?"};
+  for (int i = 0; i < 3; i++) {
+    tx = i2cSim.transactions;
+    CHECK(driveSample(d, l1, l2, sizeof l1));
+    CHECK(same(l1, line1[i]) && same(l2, line2[i]) && i2cSim.transactions == tx + 1);
+  }
+  for (int i = 3; i < 11; i++) CHECK(driveSample(d, l1, l2, sizeof l1));
+  CHECK(same(l1, "Addr 11/11: 0x76 ACK") && same(l2, "BMP280 / BME280?"));
+  CHECK(driveSample(d, l1, l2, sizeof l1) && same(l1, "Addr 1/11: 0x10 ACK"));
+  setAcks(i2cSim.acks, {0x68, 0x76});  // two addresses
+  CHECK(driveProbe(d, ctx));            // a new session: stopped and started again
+  CHECK(driveSample(d, l1, l2, sizeof l1) && same(l1, "Addr 1/2: 0x68 ACK"));
+  CHECK(i2cSim.violations == 0);
+  d.reset();
+
+  // Sweep outcomes. A NACK keeps a healthy sweep going; a timeout, bus
+  // error or stuck line ends it at once, never counted as a NACK.
+  CHECK(same(i2cProbeFailure({}, [] {}), "no-ack") && i2cFailureTx == kSweepLength);
+  CHECK(same(i2cProbeFailure({}, [] {
+              for (unsigned a = I2C_FIRST_ADDRESS; a <= I2C_LAST_ADDRESS; a++) {
+                i2cSim.acks.bits[a >> 5] |= 1u << (a & 31);
+              }
+              i2cSim.acks.count = kSweepLength;
+            }),
+             "all-addresses-ack"));
+  CHECK(i2cFailureTx == kSweepLength);
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.timeoutAt = 5; }), "bus-timeout") && i2cFailureTx == 6);
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.errorAt = 40; }), "bus-error") && i2cFailureTx == 41);
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.sdaLow = true; }), "bus-stuck-low") && i2cFailureTx == 0);
+  CHECK(i2cFailureMs >= I2C_IDLE_SETTLE_MS);  // a bounded settle first, then rejected
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.sclLow = true; }), "bus-stuck-low") && i2cFailureTx == 0);
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.stuckAfter = 30; }), "bus-stuck-low") && i2cFailureTx == 30);
+  CHECK(i2cProbeFailure({0x68}, [] {}) == nullptr && i2cFailureTx == 2 * kSweepLength);  // one ACK
+  CHECK(i2cProbeFailure({0x68, 0x76}, [] {}) == nullptr);                                 // two
+
+  // Confirmation needs two consecutive sweeps with the same set; a set
+  // that keeps changing is rejected after I2C_MAX_SWEEPS.
+  CHECK(i2cProbeFailure({0x68}, [] {
+          setAcks(i2cSim.altAcks, {0x68, 0x69});
+          i2cSim.altSweeps = 1;  // the first sweep differs, then it settles
+        }) == nullptr);
+  CHECK(i2cFailureTx == 3 * kSweepLength);
+  CHECK(same(i2cProbeFailure({0x68}, [] {
+               setAcks(i2cSim.altAcks, {0x68, 0x69});
+               i2cSim.alternate = true;  // never settles
+             }),
+             "unstable-addresses"));
+  CHECK(i2cFailureTx == I2C_MAX_SWEEPS * kSweepLength);
+
+  // Controller ownership: one started elsewhere is reported and never
+  // stopped here; a failed start is released again.
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.conflict = true; }), "bus-conflict"));
+  CHECK(i2cFailureTx == 0 && i2cSim.ends == 0);
+  CHECK(same(i2cProbeFailure({0x68}, [] { i2cSim.beginFails = true; }), "bus-init-failed"));
+  CHECK(i2cFailureTx == 0);
+
+  // A controller that will not stop: reported through resourcesReleased(),
+  // retried on later resets, never started over while uncertain.
+  i2cWorld({0x68});
+  I2cDriver f;
+  CHECK(driveProbe(f, ctx));
+  i2cSim.endFails = true;
+  f.reset();
+  CHECK(!f.resourcesReleased() && i2cSim.running);
+  const int endsBefore = i2cSim.ends;
+  f.reset();
+  CHECK(i2cSim.ends == endsBefore + 1 && !f.resourcesReleased());
+  CHECK(!f.probe(ctx) && same(f.getFailureReason(), "bus-release-failed") && i2cSim.begins == 1);
+  i2cSim.endFails = false;
+  f.reset();
+  CHECK(f.resourcesReleased() && !i2cSim.running && mock::pins[sda].mode == INPUT);
+  CHECK(driveProbe(f, ctx) && i2cSim.begins == 2);
+  f.reset();
+
+  // The whole-sweep deadline, also across a millis() rollover: a sweep that
+  // runs slowly (20 ms between calls here) is abandoned when it expires.
+  for (uint64_t startUs : {1000000ULL, (0x100000000ULL - 500ULL) * 1000ULL}) {
+    i2cWorld({0x68}, startUs);
+    I2cDriver w;
+    const uint64_t t0 = mock::nowUs;
+    for (int guard = 0; !w.probe(ctx) && w.getOperationStatus() == DriverOperationStatus::Pending && guard < 1000;
+         guard++) {
+      advanceTo(mock::nowUs + 20000);
+    }
+    CHECK(same(w.getFailureReason(), "sweep-deadline"));
+    const uint64_t ms = (mock::nowUs - t0) / 1000;
+    CHECK(ms >= I2C_SWEEP_DEADLINE_MS && ms <= I2C_SWEEP_DEADLINE_MS + 40);
+    CHECK(!i2cSim.running && i2cSim.transactions < kSweepLength);
+    w.reset();
+  }
+}
+
+// After an I2C session and its release, the same pins serve the passive
+// ADC, the DHT protocol and the ultrasonic capture.
+static void testI2cHandoff() {
+  i2cWorld({0x68});
+  I2cDriver d;
+  CHECK(driveProbe(d, fourWireContext(3)));  // SDA on C, SCL on D
+  d.reset();        // the driver releases the controller first...
+  resetTestPins();  // ...then the engine: supply off, every node plain INPUT
+  CHECK(!i2cSim.running && allProbesPlainInput() && !backend.connected);
+  CHECK(i2cSim.powerOffWhileRunning == 0);
+  i2cSim.attached = false;
+
+  PassiveDriver pd;
+  connect(2, 3, 10000);  // C-D: the former SDA and SCL
+  const int adcBefore = adcWithI2cRunning;
+  CHECK(driveProbe(pd, pairContext(5)) && same(pd.getName(), "Resistive Component"));
+  CHECK(adcWithI2cRunning == adcBefore);
+  pd.reset();
+  netReset();
+
+  Dht11Driver dd;
+  sensor.attached = true;
+  sensor.wiring = PROBE_PERMUTATIONS[13];  // VCC D, DATA C (the former SDA), GND A
+  powerByHand(PROBE_PERMUTATIONS[13]);
+  CHECK(driveProbe(dd, poweredContext(13)) && sensor.responses == 1);
+  dd.reset();
+  resetTestPins();
+  sensor.attached = false;
+
+  UltrasonicDriver ud;
+  sonar.attached = true;
+  sonar.wiring = 0;  // TRIG B, ECHO C (the former SDA)
+  powerSonarByHand();
+  CHECK(driveProbe(ud, fourWireContext(0)) && sonar.triggers == ULTRASONIC_CONFIRM_SAMPLES);
+  ud.reset();
+  resetTestPins();
+  CHECK(i2cSim.begins == 1);  // nothing restarted the I2C controller
+}
+
 #if PINDEX_POWERED_PROBING_ENABLED
 
 // ---- DHT11 through the engine (Phase 2 behaviour, preserved) ---------------
@@ -1694,7 +2219,7 @@ static void testEmptySocketScan() {
   CHECK(probeStatus().precheck == PrecheckResult::NoObviousCoupling);
   CHECK(!probeStatus().hasMapping && !probeStatus().readingValid);
   CHECK(probeStatus().componentName == nullptr && !probeStatus().measurementUnavailable);
-  CHECK(probeStatus().hardwareRequired == nullptr);
+  CHECK(probeStatus().hardwareRequiredMask == 0);
   CHECK(allProbesPlainInput());
 
   // Latency is dominated by per-mapping stabilization (~1.47 s each, 24).
@@ -1975,7 +2500,7 @@ static void testPermutationMajorDriverOrder() {
   CHECK(a.sampleStarts == 0 && b.sampleStarts == 0);
   CHECK(a.unpoweredStarts == 0 && b.unpoweredStarts == 0);  // the engine powered each attempt
   CHECK(a.resets >= 1 + PROBE_PERMUTATION_COUNT && b.resets >= 1 + PROBE_PERMUTATION_COUNT);
-  CHECK(a.unsafeResets == 0 && b.unsafeResets == 0);  // pins were safe before every reset
+  CHECK(a.resetsAfterPowerOff == 0 && b.resetsAfterPowerOff == 0);  // released before every power-off
 
   const SessionLog log = collectSessions();
   CHECK(log.violations == 0);
@@ -2057,7 +2582,7 @@ static void testPendingIsNotFailure() {
   CHECK(attempts[0].driver == 1 && attemptCount == 1);
   CHECK(mock::nowUs / 1000 - attempts[0].us / 1000 >= stuck.req.operationTimeoutMs);
   CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 3000));
-  CHECK(same(probeStatus().componentName, "Fake Next") && stuck.unsafeResets == 0);
+  CHECK(same(probeStatus().componentName, "Fake Next") && stuck.resetsAfterPowerOff == 0);
 }
 
 static void testRequirementsDriveScheduling() {
@@ -2102,7 +2627,7 @@ static void testRemovalClearsActiveDriver() {
   CHECK(probeStatus().componentName == nullptr && !probeStatus().hasMapping);
   CHECK(!probeStatus().detected && !probeStatus().readingValid);
   CHECK(probeStatus().telemetry1[0] == '\0' && probeStatus().telemetry2[0] == '\0');
-  CHECK(allProbesPlainInput() && a.unsafeResets == 0 && b.unsafeResets == 0);
+  CHECK(allProbesPlainInput() && a.resetsAfterPowerOff == 0 && b.resetsAfterPowerOff == 0);
   for (int i = detectedAt; i < attemptCount; i++) {  // recovery used only the saved driver
     CHECK(attempts[i].driver == 2 && attempts[i].slot == 2);
   }
@@ -2131,7 +2656,7 @@ static void testUltrasonicDetection() {
   sonar.attached = true;
   sonar.wiring = 0;  // A VCC, B TRIG, C ECHO, D GND
   CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
-  CHECK(probeStatus().scanTotal == PROBE_FOUR_WIRE_COUNT && probeStatus().hardwareRequired == nullptr);
+  CHECK(probeStatus().scanTotal == PROBE_FOUR_WIRE_COUNT && probeStatus().hardwareRequiredMask == 0);
   CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 2000));
   CHECK(sonar.triggers == ULTRASONIC_CONFIRM_SAMPLES && !probeStatus().readingValid);
   CHECK(sonar.triggerUs[0] - backend.connectedAtUs >= (ULTRASONIC_POWER_STABILIZE_MS - 1) * 1000ULL);
@@ -2195,7 +2720,7 @@ static void testFourWireDiscoveryOrder() {
   CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
   CHECK(attemptCount == PROBE_FOUR_WIRE_COUNT);
   for (int i = 0; i < attemptCount; i++) CHECK(attempts[i].slot == i);
-  CHECK(f.unpoweredStarts == 0 && f.unsafeResets == 0);
+  CHECK(f.unpoweredStarts == 0 && f.resetsAfterPowerOff == 0);
   CHECK(backend.connects == PROBE_FOUR_WIRE_COUNT && backend.violations == 0 && !backend.connected);
   CHECK(collectSessions().count == 0 && allProbesPlainInput());  // no GPIO ever drove a supply
 
@@ -2232,6 +2757,181 @@ static void testBackendRefusal() {
   CHECK(backend.requests == PROBE_FOUR_WIRE_COUNT && backend.connects == 0 && backend.violations == 0);
   CHECK(same(probeStatus().lastError, "backend-refused") && allProbesPlainInput());
 }
+
+// ---- I2C through the engine --------------------------------------------------
+
+static void testI2cDetection() {
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);  // a protected 3.3 V backend
+  i2cSim.attached = true;                   // A VCC, C SDA, D SCL, B GND (mapping 4)
+  setAcks(i2cSim.acks, {0x3C, 0x68});
+  CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
+  CHECK(probeStatus().scanTotal == PROBE_FOUR_WIRE_COUNT && probeStatus().hardwareRequiredMask == 0);
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 10000));
+  // Mappings 1-3 answered nothing (one sweep each); mapping 4 needed two.
+  CHECK(i2cSim.transactions == 3 * kSweepLength + 2 * kSweepLength);
+  CHECK(i2cSim.begins == 4 && backend.connects == 4);
+  CHECK(i2cSim.beganAtUs - backend.connectedAtUs >= (I2C_POWER_STABILIZE_MS - 1) * 1000ULL);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, I2C_SAMPLE_INTERVAL_MS + 500));
+  CHECK(same(probeStatus().componentName, "I2C Device"));
+  CHECK(same(probeStatus().telemetry1, "Addr 1/2: 0x3C ACK") && same(probeStatus().telemetry2, "SSD1306 / OLED?"));
+  char first[PROBE_MAPPING_TEXT_LEN];
+  char second[PROBE_MAPPING_TEXT_LEN];
+  formatProbeMapping(probeStatus().mapping, probeStatus().signalLabel, first, second, sizeof first);
+  CHECK(same(first, "A:VCC B:GND") && same(second, "C:SDA D:SCL"));
+  CHECK(backend.connected && backend.supply == kBackendSupply3V3 && backend.vcc == 0 && backend.gnd == 1);
+  CHECK(mock::pins[gpioOf(0)].mode == INPUT && mock::pins[gpioOf(1)].mode == INPUT);  // supply: backend only
+  char diag[64];
+  CHECK(probeFormatDiagnostics(diag, sizeof diag) && same(diag, "I2C ACK (2): 0x3C 0x68"));
+
+  // Rotation: the next sample presents the next address, backed by its own
+  // fresh ACK. Reading the snapshot (the OLED's job) never touches the bus,
+  // and nothing else happens on it between samples.
+  int tx = i2cSim.transactions;
+  for (int i = 0; i < 1000; i++) {
+    formatProbeMapping(probeStatus().mapping, probeStatus().signalLabel, first, second, sizeof first);
+    probeFormatDiagnostics(diag, sizeof diag);
+  }
+  CHECK(i2cSim.transactions == tx);
+  const uint32_t rev = probeStatus().revision;
+  CHECK(runUntil([] { return same(probeStatus().telemetry1, "Addr 2/2: 0x68 ACK"); }, I2C_SAMPLE_INTERVAL_MS + 100));
+  CHECK(same(probeStatus().telemetry2, "MPU6050 / DS3231?") && probeStatus().revision != rev);
+  CHECK(i2cSim.transactions == tx + 1 && i2cSim.log[tx] == 0x68);
+  runMs(I2C_SAMPLE_INTERVAL_MS - 100);
+  CHECK(i2cSim.transactions == tx + 1);
+  CHECK(runUntil([] { return same(probeStatus().telemetry1, "Addr 1/2: 0x3C ACK"); }, 500));
+  CHECK(i2cSim.transactions == tx + 2);
+
+  // Loss of response: stale at once, the controller stopped before the
+  // supply, retried with fresh power, stabilization and confirmation, then
+  // cleared. This is inferred, never proof of removal.
+  i2cSim.attached = false;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, I2C_SAMPLE_INTERVAL_MS + 100));
+  CHECK(phase() == ProbePhase::Retrying && probeStatus().readingStale && probeStatus().readingValid);
+  CHECK(same(probeStatus().lastError, "address-lost"));
+  CHECK(!backend.connected && !i2cSim.running && allProbesPlainInput());
+  const int begins = i2cSim.begins;
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 15000));
+  CHECK(!probeStatus().hasMapping && probeStatus().telemetry1[0] == '\0');
+  CHECK(probeStatus().signalLabel[0] == nullptr && probeStatus().componentName == nullptr);
+  CHECK(i2cSim.begins == begins + PROBE_MAX_CONSECUTIVE_FAILURES - 1);  // each retry re-powered
+  CHECK(!probeFormatDiagnostics(diag, sizeof diag) && diag[0] == '\0');   // results cleared
+  CHECK(i2cSim.powerOffWhileRunning == 0 && backend.violations == 0 && i2cSim.violations == 0);
+
+  // It answers again: rediscovered from scratch after the rescan interval.
+  i2cSim.attached = true;
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, PROBE_RESCAN_INTERVAL_MS + 10000));
+  CHECK(i2cSim.powerOffWhileRunning == 0 && i2cSim.violations == 0);
+
+  // A module on the last mapping is found too (all 24 are tried).
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  i2cSim.attached = true;
+  i2cSim.wiring = PROBE_FOUR_WIRE_COUNT - 1;  // D VCC, C SDA, B SCL, A GND
+  setAcks(i2cSim.acks, {0x10});
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 30000));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[PROBE_FOUR_WIRE_COUNT - 1]));
+  CHECK(same(probeStatus().telemetry1, "Addr: 0x10 (ACK)") && same(probeStatus().telemetry2, "Unknown model"));
+  CHECK(backend.connects == PROBE_FOUR_WIRE_COUNT && i2cSim.powerOffWhileRunning == 0);
+}
+
+// Clearing mid-sweep: the controller stops before the supply goes, and the
+// rescan starts a fresh sweep from the first address.
+static void testI2cClearMidSweep() {
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  CHECK(runUntil([] { return i2cSim.transactions >= 20; }, 2000));
+  CHECK(i2cSim.running && backend.connected);
+  CHECK(probeRequestClear());
+  CHECK(!i2cSim.running && !backend.connected && i2cSim.powerOffWhileRunning == 0);
+  for (uint8_t g : PROBE_NODE_GPIO) CHECK(!mock::isOutput(g));
+  const int tx = i2cSim.transactions;
+  CHECK(runUntil([&] { return i2cSim.transactions > tx; }, 1000));
+  CHECK(i2cSim.log[tx] == I2C_FIRST_ADDRESS);
+}
+
+// A controller that will not stop: the supply is still removed (never
+// kept on to retry cleanup), a fault is latched, and nothing else starts
+// until it stops and a retry is requested.
+static void testI2cReleaseFailure() {
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  i2cSim.endFails = true;
+  CHECK(runUntil([] { return phase() == ProbePhase::Fault; }, 5000));
+  CHECK(same(probeStatus().lastError, "release-failed"));
+  CHECK(!backend.connected);
+  CHECK(i2cSim.begins == 1 && i2cSim.transactions == kSweepLength);  // one empty sweep, then nothing
+  const int ends = i2cSim.ends;
+  runMs(5000);
+  CHECK(phase() == ProbePhase::Fault && !backend.connected);
+  CHECK(i2cSim.begins == 1 && i2cSim.transactions == kSweepLength && i2cSim.ends == ends);
+  i2cSim.endFails = false;
+  CHECK(probeRequestRetry());
+  CHECK(runUntil([] { return i2cSim.begins == 2; }, 3000));
+  CHECK(phase() == ProbePhase::Scanning && !i2cSim.endFails);
+}
+
+#if PINDEX_I2C_GPIO_POWER_ENABLED
+
+// The experimental GPIO profile (this build only). Without a protected
+// backend, I2C mappings are powered from the probe GPIOs: GND LOW first,
+// then VCC HIGH; the controller stops and SDA/SCL are released before VCC;
+// precheck vetoes still apply; the 5 V ultrasonic driver is never granted
+// this profile, and a capable backend is still preferred.
+static void testI2cGpioProfile() {
+  useDrivers(&i2c, &ultrasonic);
+  resetWorld();  // no backend at all
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, {0x76});
+  CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
+  CHECK(!needsHardware(&i2c) && needsHardware(&ultrasonic));
+  CHECK(probeStatus().scanTotal == PROBE_FOUR_WIRE_COUNT);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 10000));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+  CHECK(mock::drivesHigh(gpioOf(0)) && mock::drivesLow(gpioOf(1)));  // VCC A HIGH, GND B LOW
+  CHECK(backend.requests == 0 && sonar.pulses == 0);
+  CHECK(highDriveEvents == 4);  // one VCC drive per attempt; SDA/SCL never push-pull HIGH
+  SessionLog log = collectSessions();
+  CHECK(log.violations == 0 && log.count == 4);
+  for (int i = 0; i < log.count && i < 4; i++) CHECK(sessionPowers(log.s[i], PROBE_FOUR_WIRE_MAPPINGS[i]));
+  CHECK(i2cSim.powerOffWhileRunning == 0 && i2cSim.violations == 0);
+
+  // A VCC-GND short on A-B vetoes every mapping that would drive A or B.
+  resetWorld();
+  connect(0, 1, 1.0);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 20000));
+  log = collectSessions();
+  CHECK(log.violations == 0 && poweredSessions(log) == 12);
+  for (int i = 0; i < log.count; i++) CHECK(log.s[i].vcc == 2 || log.s[i].vcc == 3);
+
+  // A protected 3.3 V backend takes precedence: no GPIO supply at all.
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, {0x76});
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 10000));
+  CHECK(highDriveEvents == 0 && backend.connects == 4 && collectSessions().count == 0);
+}
+
+#else
+
+// Default build: the experimental profile is off, so with no protected
+// 3.3 V backend there is no GPIO-sourced I2C power at all; a 5 V-only
+// backend does not count either.
+static void testI2cNoGpioPower() {
+  for (uint16_t caps : {static_cast<uint16_t>(0), static_cast<uint16_t>(kBackendFourWireBaseline | kBackendSupply5V)}) {
+    useDrivers(&i2c);
+    resetWorld(1000000ULL, caps);
+    i2cSim.attached = true;
+    setAcks(i2cSim.acks, {0x68});
+    runMs(10000);
+    CHECK(needsHardware(&i2c) && phase() == ProbePhase::NoComponent);
+    CHECK(i2cSim.begins == 0 && backend.requests == 0 && highDriveEvents == 0);
+    CHECK(collectSessions().count == 0);
+  }
+}
+
+#endif  // PINDEX_I2C_GPIO_POWER_ENABLED
 
 #endif  // PINDEX_POWERED_PROBING_ENABLED
 
@@ -2321,15 +3021,89 @@ static void testCouplingRoutesToPassive() {
 }
 
 static void testDhtFirstThenPassive() {
-  useDrivers(&dht, &ultrasonic, &passive);
+  useDrivers(&dht, &i2c, &ultrasonic, &passive);  // the production priority order
   resetWorld(1000000ULL, kAllBackendCaps);
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[0];
   CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
   CHECK(same(probeStatus().componentName, "DHT11 Temp & Hum"));
   CHECK(senseCount == 0);  // the passive fallback never ran
-  CHECK(mock::attachCalls == 0 && backend.requests == 0);  // nor the lower-priority ultrasonic
+  CHECK(mock::attachCalls == 0 && backend.requests == 0);  // nor the lower-priority four-wire drivers
+  CHECK(i2cSim.begins == 0);
   CHECK(adcReadsInCritical == 0);
+}
+
+// Supply profiles stay separate: a 5 V-only backend serves the ultrasonic
+// driver but never I2C, a 3.3 V-only backend the reverse; partial
+// capability sets count as none; the GPIO profile (only in its build)
+// serves I2C alone. As shipped, both are skipped while DHT11 and passive
+// scans run; DHT11 first, passive last.
+static void testI2cSupplyProfiles() {
+  const bool gpio = PINDEX_I2C_GPIO_POWER_ENABLED != 0;
+  struct Case {
+    uint16_t caps;
+    bool i2cRuns;
+    bool sonarRuns;
+  };
+  const Case cases[] = {
+      {0, gpio, false},
+      {static_cast<uint16_t>(kBackendFourWireBaseline | kBackendSupply5V), gpio, true},
+      {static_cast<uint16_t>(kBackendFourWireBaseline | kBackendSupply3V3), true, false},
+      {kAllBackendCaps, true, true},
+      {static_cast<uint16_t>(kAllBackendCaps & ~kBackendBreakBeforeMake), gpio, false},
+      {static_cast<uint16_t>(kAllBackendCaps & ~kBackendAssignmentProtection), gpio, false},
+  };
+  for (const Case &c : cases) {
+    useDrivers(&dht, &i2c, &ultrasonic, &passive);
+    resetWorld(1000000ULL, c.caps);
+    runMs(10);
+    CHECK(needsHardware(&i2c) == !c.i2cRuns && needsHardware(&ultrasonic) == !c.sonarRuns);
+    CHECK(!needsHardware(&dht) && !needsHardware(&passive));
+    const int fourWire = (c.i2cRuns ? PROBE_FOUR_WIRE_COUNT : 0) + (c.sonarRuns ? PROBE_FOUR_WIRE_COUNT : 0);
+    CHECK(probeStatus().scanTotal == PROBE_PERMUTATION_COUNT + fourWire + PROBE_PAIR_COUNT);
+  }
+
+  // As shipped (no backend): a resistor on C-D is still found by the
+  // passive driver after the full active scan, with no I2C controller or
+  // interrupt left running when it senses.
+  useDrivers(&dht, &i2c, &ultrasonic, &passive);
+  resetWorld();
+  connect(2, 3, 10000);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 90000));
+  CHECK(same(probeStatus().componentName, "Resistive Component"));
+  CHECK(i2cSim.begins == (gpio ? PROBE_FOUR_WIRE_COUNT : 0) && mock::attachCalls == 0);
+  CHECK(i2cSim.powerOffWhileRunning == 0);
+}
+
+// A VCC-GND short (A-B) on the socket: every mapping that would supply A or
+// B is vetoed, whatever the I2C driver might find. Mappings that keep the
+// coupling off VCC still run: SDA/SCL are open-drain and GND only sinks.
+static void testI2cPrecheckVeto() {
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  i2cSim.attached = true;  // its own VCC is A: that mapping is never powered
+  setAcks(i2cSim.acks, {0x68});
+  connect(0, 1, 1.0);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 20000));
+  CHECK(probeStatus().coupledPairs == probePairBit(0, 1));
+  CHECK((backend.vccNodesUsed & 0x3) == 0 && backend.connects == 12 && i2cSim.begins == 12);
+  CHECK(!probeStatus().hasMapping && same(probeStatus().lastError, "no-ack"));
+}
+
+// Among eligible four-wire drivers, registry order applies per mapping
+// (I2C at 3.3 V, then the ultrasonic at 5 V), each with its own precheck
+// and power cycle; the passive fallback comes only after every one.
+static void testFourWirePriority() {
+  FakeDriver t(9, "Fake T", ProbeTopology::TwoTerminal, ExcitationPolicy::WeakPullOnly);
+  useDrivers(&i2c, &ultrasonic, &t);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 60000));
+  CHECK(backend.connects == 2 * PROBE_FOUR_WIRE_COUNT && backend.violations == 0);
+  for (int i = 0; i < 2 * PROBE_FOUR_WIRE_COUNT; i++) {
+    CHECK(backend.supplyLog[i] == (i % 2 == 0 ? kBackendSupply3V3 : kBackendSupply5V));
+  }
+  CHECK(t.probeStarts == PROBE_PAIR_COUNT && attempts[0].topology == ProbeTopology::TwoTerminal);
+  CHECK(i2cSim.powerOffWhileRunning == 0 && !anyProbeIsrAttached() && allProbesPlainInput());
 }
 
 // The shipped situation: no protected four-wire backend. The ultrasonic
@@ -2339,14 +3113,14 @@ static void testDhtFirstThenPassive() {
 static void testUltrasonicHardwareRequired() {
   useDrivers(&dht, &ultrasonic, &passive);
   resetWorld();  // backend capabilities: none
-  CHECK(same(probeStatus().hardwareRequired, "HC-SR04 Ultrasonic"));
+  CHECK(needsHardware(&ultrasonic));
   sensor.attached = true;
   sensor.wiring = PROBE_PERMUTATIONS[8];  // B = VCC, A = DATA, D = GND
   CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
   CHECK(probeStatus().scanTotal == PROBE_PERMUTATION_COUNT + PROBE_PAIR_COUNT);  // no four-wire slots
   CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 40000));
   CHECK(same(probeStatus().componentName, "DHT11 Temp & Hum"));
-  CHECK(same(probeStatus().hardwareRequired, "HC-SR04 Ultrasonic"));  // reported, not a fault
+  CHECK(needsHardware(&ultrasonic));  // reported, not a fault
   CHECK(mock::attachCalls == 0 && backend.requests == 0 && highDriveEvents > 0);
   const SessionLog log = collectSessions();
   CHECK(log.violations == 0 && log.count == 9);
@@ -2369,7 +3143,7 @@ static void testUltrasonicHardwareRequired() {
     resetWorld(1000000ULL, caps);
     runMs(3000);
     CHECK(probeStatus().scanTotal == PROBE_PERMUTATION_COUNT + PROBE_PAIR_COUNT);
-    CHECK(same(probeStatus().hardwareRequired, "HC-SR04 Ultrasonic"));
+    CHECK(needsHardware(&ultrasonic));
     CHECK(mock::attachCalls == 0 && backend.requests == 0);
   }
 }
@@ -2617,19 +3391,23 @@ static void testMeasurementUnavailable() {
 
 #if PASSIVE_ONLY_BUILD
 
-// Powered probing off, passive on: the DHT and ultrasonic drivers are
-// registered but never run (even with a capable backend), nothing is
-// powered or driven HIGH or push-pull, and passive detection works.
+// Powered probing off, passive on: the DHT, I2C and ultrasonic drivers are
+// registered but never run (even with a capable backend, and with the I2C
+// GPIO profile on in this build), nothing is powered or driven HIGH or
+// push-pull, and passive detection works.
 static void testPassiveOnlyBuild() {
-  useDrivers(&dht, &ultrasonic, &passive);
+  useDrivers(&dht, &i2c, &ultrasonic, &passive);
   resetWorld(1000000ULL, kAllBackendCaps);
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, {0x68});
   connect(0, 1, 10000);
   CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
   CHECK(probeStatus().scanTotal == PROBE_PAIR_COUNT);
-  CHECK(probeStatus().hardwareRequired == nullptr);  // disabled, not missing hardware
+  CHECK(probeStatus().hardwareRequiredMask == 0);  // disabled, not missing hardware
   CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
   CHECK(same(probeStatus().componentName, "Resistive Component"));
   CHECK(highDriveEvents == 0 && backend.requests == 0 && mock::attachCalls == 0);
+  CHECK(i2cSim.begins == 0 && !needsHardware(&i2c));  // off, not "hardware required"
   for (size_t i = 0; i < mock::eventCount; i++) {
     if (nodeOf(mock::events[i].pin) < 0) continue;
     CHECK(mock::events[i].mode != OUTPUT && mock::events[i].mode != (OUTPUT_OPEN_DRAIN | PULLUP));
@@ -2651,7 +3429,7 @@ static void testDisabledNeverDrives() {
   const uint32_t rev = probeStatus().revision;
   runMs(30000);
   CHECK(phase() == ProbePhase::Disabled);
-  CHECK(probeStatus().revision == rev && probeStatus().hardwareRequired == nullptr);
+  CHECK(probeStatus().revision == rev && probeStatus().hardwareRequiredMask == 0);
   CHECK(!probeRequestRetry() && !probeRequestClear());  // never bypasses the setting
   runMs(1000);
   CHECK(phase() == ProbePhase::Disabled);
@@ -2679,11 +3457,14 @@ int main() {
   testMappingText();
   testPassiveEstimate();
   testUltrasonicEchoMath();
+  testI2cHintsAndCodes();
   testDht11DriverContract();
   testPassiveDriverContract();
   testUltrasonicDriverContract();
+  testI2cDriverContract();
   testPassiveToDhtHandoff();
   testUltrasonicHandoff();
+  testI2cHandoff();
 #if PINDEX_POWERED_PROBING_ENABLED
   testEmptySocketScan();
   testDetectionNeedsTwoFrames();
@@ -2702,6 +3483,14 @@ int main() {
   testUltrasonicDetection();
   testFourWireDiscoveryOrder();
   testBackendRefusal();
+  testI2cDetection();
+  testI2cClearMidSweep();
+  testI2cReleaseFailure();
+#if PINDEX_I2C_GPIO_POWER_ENABLED
+  testI2cGpioProfile();
+#else
+  testI2cNoGpioPower();
+#endif
 #endif
 #if FULL_BUILD
   testTopologyEnumeration();
@@ -2709,6 +3498,9 @@ int main() {
   testDhtFirstThenPassive();
   testUltrasonicHardwareRequired();
   testFourWirePrecheckVeto();
+  testI2cSupplyProfiles();
+  testI2cPrecheckVeto();
+  testFourWirePriority();
 #endif
 #if PINDEX_PASSIVE_PROBING_ENABLED
   testPassiveResistor();
@@ -2729,7 +3521,8 @@ int main() {
   CHECK(lockedPinModes == 0);      // pinMode() never ran inside the capture lock
   CHECK(adcReadsInCritical == 0);  // no ADC work inside the DHT critical section
   CHECK(adcWithIsrAttached == 0);  // ultrasonic interrupts released before any ADC use
-  printf("build powered=%d passive=%d: %d checks, %d failed\n", PINDEX_POWERED_PROBING_ENABLED,
-         PINDEX_PASSIVE_PROBING_ENABLED, checks, failures);
+  CHECK(adcWithI2cRunning == 0);   // the I2C controller stopped before any ADC use
+  printf("build powered=%d passive=%d i2c-gpio=%d: %d checks, %d failed\n", PINDEX_POWERED_PROBING_ENABLED,
+         PINDEX_PASSIVE_PROBING_ENABLED, PINDEX_I2C_GPIO_POWER_ENABLED, checks, failures);
   return failures == 0 ? 0 : 1;
 }

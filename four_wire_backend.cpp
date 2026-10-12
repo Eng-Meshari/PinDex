@@ -9,6 +9,6 @@
 
 uint16_t fourWireBackendCapabilities() { return 0; }
 
-bool fourWireBackendConnect(uint8_t, uint8_t, uint8_t, uint8_t) { return false; }
+bool fourWireBackendConnect(uint16_t, uint8_t, uint8_t, uint8_t, uint8_t) { return false; }
 
 void fourWireBackendDisconnect() {}  // nothing exists to switch off

@@ -94,8 +94,8 @@ struct ProbeStatus {
   PrecheckResult precheck;       // latest completed precheck
   uint8_t coupledPairs;          // pairs the latest precheck saw coupled
   bool measurementUnavailable;   // last cycle failed on measurement errors (e.g. ADC)
-  const char *hardwareRequired;  // first enabled driver skipped because the four-wire
-                                 // backend lacks capabilities it needs, or nullptr
+  uint8_t hardwareRequiredMask;  // bit i: registered driver i is enabled but has no eligible
+                                 // supply (no capable backend, profile off); it is skipped
   uint32_t revision;             // changes whenever a displayed field changes
 };
 
@@ -126,6 +126,11 @@ bool probeRequestClear();
 // Forwards a user command to the detected driver. False if no driver is
 // detected or it did not accept the command.
 bool probeSendCommand(char command);
+
+// The detected driver's diagnostic text (cached results only; no bus or pin
+// activity), e.g. every I2C address found. buf is always terminated; false
+// if nothing is detected or the driver has nothing to report.
+bool probeFormatDiagnostics(char *buf, size_t len);
 
 // Mapping text in socket order, as two halves that each fit one OLED line
 // (the joined four-node text does not, at the size-1 font):

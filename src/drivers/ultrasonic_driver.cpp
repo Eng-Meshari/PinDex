@@ -53,7 +53,8 @@ const DriverRequirements kRequirements = {
     ULTRASONIC_MIN_INTERVAL_MS,         // minAcquisitionIntervalMs
     ULTRASONIC_SAMPLE_INTERVAL_MS,      // sampleIntervalMs
     ULTRASONIC_OPERATION_TIMEOUT_MS,    // operationTimeoutMs
-    kBackendSupply5V,                   // on top of the four-wire baseline
+    SupplyProfile::Backend5V,           // backend 5 V only, never GPIOs
+    false,                              // openDrainSignals: TRIG is push-pull
     {"TRG", "ECH"},                     // signalLabel: SIG1, SIG2
 };
 
