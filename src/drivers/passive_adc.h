@@ -26,5 +26,6 @@ PassiveAdcStatus passiveAdcReadMv(uint8_t pin, uint16_t &millivolts);
 // any other driver. Idempotent; never energises the pin.
 void passiveAdcEndSense(uint8_t pin);
 
-// Whether millivolts come from an ADC calibration scheme (else nominal).
+// Whether millivolts come from an ADC calibration scheme (else nominal),
+// for every ADC unit claimed so far (the probes span ADC1 and ADC2).
 bool passiveAdcCalibrated();

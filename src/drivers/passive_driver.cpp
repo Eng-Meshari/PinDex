@@ -7,7 +7,7 @@
 #include "passive_adc.h"
 
 // Measurement, per orientation of the probed pair (sense, sink):
-//   1. both terminals plain INPUT; the unused node is never touched;
+//   1. both terminals plain INPUT; the two unused nodes are never touched;
 //   2. sense: ADC channel + internal pull-up (adapter);
 //   3. reference window with the sink still released: the pull-up must lift
 //      the node near the rail, which verifies it is effective while sampled;
@@ -33,6 +33,8 @@ const DriverRequirements kRequirements = {
     PASSIVE_SAMPLE_PERIOD_MS,        // minAcquisitionIntervalMs
     PASSIVE_SAMPLE_PERIOD_MS,        // sampleIntervalMs
     PASSIVE_OPERATION_TIMEOUT_MS,    // operationTimeoutMs
+    0,                               // backendCapabilities
+    {nullptr, nullptr},              // signalLabel
 };
 
 const size_t kTextLen = 24;
@@ -109,7 +111,7 @@ bool PassiveDriver::probe(const ProbeContext &context) {
       return fail("contract-violation", false);
     }
   } else {
-    first_ = context.pair.first;  // context.pair.unused is deliberately ignored
+    first_ = context.pair.first;  // context.pair.unused[] is deliberately ignored
     second_ = context.pair.second;
     bound_ = false;
     clearClassification();  // new session: calibration and history invalidated

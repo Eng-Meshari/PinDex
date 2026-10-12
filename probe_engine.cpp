@@ -5,19 +5,23 @@
 #include <string.h>
 
 #include "config.h"
+#include "four_wire_backend.h"
 #include "sensor_driver.h"
 #include "src/drivers/driver_registry.h"
 
 // Safety scope: plain INPUT (high impedance) only means the firmware is not
 // driving the probes. It is NOT protection against shorts, overvoltage, ESD
-// or charged capacitors. Powered probing drives probe GPIOs as a nominal
-// 3.3V logic-level supply, not a regulated rail, and must only be enabled
-// behind a reviewed protected interface (see README).
+// or charged capacitors. Three-wire powered probing drives probe GPIOs as a
+// nominal 3.3V logic-level supply, not a regulated rail, and must only be
+// enabled behind a reviewed protected interface (see README). Four-wire
+// probing never uses a GPIO as a supply: it runs only on a backend that
+// reports the required capabilities (four_wire_backend.h).
 //
 // Routing: the weak-pull precheck only observes. A coupled pair (contact or
 // finite resistance; the digital test cannot tell which) never authorises
 // powered drive across it; it is measured by weak-pull (passive) drivers
-// instead. Inconsistent readings are retried, then treated as "unknown".
+// instead. Seeing no coupling never authorises anything either.
+// Inconsistent readings are retried, then treated as "unknown".
 //
 // The engine owns pins, power, prechecks, scheduling, confirmation and
 // removal. Drivers (sensor_driver.h) are chosen by capabilities only; this
@@ -28,21 +32,78 @@ static_assert(PROBE_RETRY_COOLDOWN_MS >= PROBE_POWER_OFF_MS,
 static_assert(PROBE_RESCAN_INTERVAL_MS >= PROBE_POWER_OFF_MS,
               "a rescan must include the power-off interval");
 static_assert(PROBE_CONFIRM_FRAMES >= 1, "confirmation needs at least one acquisition");
+static_assert(PROBE_NODE_COUNT == 4, "the node and mapping tables below are written for A/B/C/D");
+static_assert(PROBE_PIN_A != PROBE_PIN_B && PROBE_PIN_A != PROBE_PIN_C && PROBE_PIN_A != PROBE_PIN_D &&
+                  PROBE_PIN_B != PROBE_PIN_C && PROBE_PIN_B != PROBE_PIN_D && PROBE_PIN_C != PROBE_PIN_D,
+              "every socket node needs its own GPIO");
+static_assert(PROBE_PERMUTATION_COUNT == 4 * 3 * 2, "three-wire: ordered triples of 4 nodes");
+static_assert(PROBE_FOUR_WIRE_COUNT == 4 * 3 * 2 * 1, "four-wire: orderings of 4 nodes");
+static_assert(PROBE_PAIR_COUNT == 4 * 3 / 2, "two-terminal: unordered pairs of 4 nodes");
+static_assert(PROBE_PAIR_COUNT <= 8, "ProbeStatus::coupledPairs is an 8-bit pair mask");
+
+const uint8_t PROBE_NODE_GPIO[] = {PROBE_PIN_A, PROBE_PIN_B, PROBE_PIN_C, PROBE_PIN_D};
+const char PROBE_NODE_LABEL[] = {'A', 'B', 'C', 'D'};
+static_assert(sizeof PROBE_NODE_GPIO == PROBE_NODE_COUNT && sizeof PROBE_NODE_LABEL == PROBE_NODE_COUNT,
+              "one GPIO and one label per node");
+
+namespace {
+
+constexpr uint8_t A = 0, B = 1, C = 2, D = 3;  // node indices
+
+constexpr ProbeMapping threeWire(uint8_t vcc, uint8_t data, uint8_t gnd) {
+  ProbeMapping m{ProbeTopology::ThreeWirePowered, {}};  // every node Unused
+  m.role[vcc] = NodeRole::Vcc;
+  m.role[data] = NodeRole::Data;
+  m.role[gnd] = NodeRole::Gnd;
+  return m;
+}
+
+constexpr ProbeMapping fourWire(uint8_t vcc, uint8_t sig1, uint8_t sig2, uint8_t gnd) {
+  ProbeMapping m{ProbeTopology::FourWirePowered, {}};
+  m.role[vcc] = NodeRole::Vcc;
+  m.role[sig1] = NodeRole::Sig1;
+  m.role[sig2] = NodeRole::Sig2;
+  m.role[gnd] = NodeRole::Gnd;
+  return m;
+}
+
+constexpr ProbeMapping terminals(uint8_t x, uint8_t y) {
+  ProbeMapping m{ProbeTopology::TwoTerminal, {}};
+  m.role[x] = NodeRole::Terminal;
+  m.role[y] = NodeRole::Terminal;
+  return m;
+}
+
+}  // namespace
+
+// The six VCC/DATA/GND patterns of a node set x < y < z, in the original
+// Phase 2 scan order.
+#define PATTERNS(x, y, z)                                                                    \
+  threeWire(x, y, z), threeWire(z, y, x), threeWire(y, x, z), threeWire(y, z, x), \
+      threeWire(x, z, y), threeWire(z, x, y)
 
 const ProbeMapping PROBE_PERMUTATIONS[PROBE_PERMUTATION_COUNT] = {
-    // Roles of A, B, C.
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Vcc, NodeRole::Data, NodeRole::Gnd}},  // 1: A B C
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Gnd, NodeRole::Data, NodeRole::Vcc}},  // 2: C B A
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Data, NodeRole::Vcc, NodeRole::Gnd}},  // 3: B A C
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Gnd, NodeRole::Vcc, NodeRole::Data}},  // 4: B C A
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Vcc, NodeRole::Gnd, NodeRole::Data}},  // 5: A C B
-    {ProbeTopology::ThreeWirePowered, {NodeRole::Data, NodeRole::Gnd, NodeRole::Vcc}},  // 6: C A B
+    PATTERNS(A, B, C),  // 1-6: the original A/B/C scan, unchanged
+    PATTERNS(A, B, D),  // 7-12
+    PATTERNS(A, C, D),  // 13-18
+    PATTERNS(B, C, D),  // 19-24
+};
+
+#undef PATTERNS
+
+const ProbeMapping PROBE_FOUR_WIRE_MAPPINGS[PROBE_FOUR_WIRE_COUNT] = {
+    // VCC, SIG1, SIG2, GND nodes.
+    fourWire(A, B, C, D), fourWire(A, B, D, C), fourWire(A, C, B, D), fourWire(A, C, D, B),
+    fourWire(A, D, B, C), fourWire(A, D, C, B), fourWire(B, A, C, D), fourWire(B, A, D, C),
+    fourWire(B, C, A, D), fourWire(B, C, D, A), fourWire(B, D, A, C), fourWire(B, D, C, A),
+    fourWire(C, A, B, D), fourWire(C, A, D, B), fourWire(C, B, A, D), fourWire(C, B, D, A),
+    fourWire(C, D, A, B), fourWire(C, D, B, A), fourWire(D, A, B, C), fourWire(D, A, C, B),
+    fourWire(D, B, A, C), fourWire(D, B, C, A), fourWire(D, C, A, B), fourWire(D, C, B, A),
 };
 
 const ProbeMapping PROBE_PAIRS[PROBE_PAIR_COUNT] = {
-    {ProbeTopology::TwoTerminal, {NodeRole::Terminal, NodeRole::Terminal, NodeRole::Unused}},  // A-B
-    {ProbeTopology::TwoTerminal, {NodeRole::Unused, NodeRole::Terminal, NodeRole::Terminal}},  // B-C
-    {ProbeTopology::TwoTerminal, {NodeRole::Terminal, NodeRole::Unused, NodeRole::Terminal}},  // A-C
+    terminals(A, B), terminals(B, C), terminals(A, C),  // the original three
+    terminals(A, D), terminals(B, D), terminals(C, D),
 };
 
 uint8_t probePairBit(uint8_t nodeX, uint8_t nodeY) {
@@ -65,14 +126,13 @@ int probeNodeWithRole(const ProbeMapping &mapping, NodeRole role, int nth) {
 
 namespace {
 
-// Socket labels and GPIOs are kept apart: roles are resolved per node.
-const uint8_t kNodeGpio[PROBE_NODE_COUNT] = {PROBE_PIN_A, PROBE_PIN_B, PROBE_PIN_C};
-const char kNodeLabel[PROBE_NODE_COUNT] = {'A', 'B', 'C'};
 const uint8_t kNoPin = 0xFF;  // never a valid GPIO; Arduino rejects it
 
-// Every cycle tries powered protocols first; two-terminal (passive)
+// Every cycle tries the active protocols first (registry priority: DHT11 is
+// three-wire, the ultrasonic four-wire); two-terminal (passive)
 // interpretation is the fallback once no active protocol answered.
 const ProbeTopology kTopologyOrder[] = {ProbeTopology::ThreeWirePowered,
+                                        ProbeTopology::FourWirePowered,
                                         ProbeTopology::TwoTerminal};
 
 enum class State : uint8_t {
@@ -122,42 +182,83 @@ void enter(State next, uint32_t now) {
   stateSinceMs = now;
 }
 
-uint8_t gpio(uint8_t node) { return kNodeGpio[node]; }
+uint8_t gpio(uint8_t node) { return PROBE_NODE_GPIO[node]; }
 
 uint8_t gpioWithRole(const ProbeMapping &m, NodeRole role, int nth = 0) {
   const int n = probeNodeWithRole(m, role, nth);
-  return n >= 0 ? kNodeGpio[n] : kNoPin;
+  return n >= 0 ? PROBE_NODE_GPIO[n] : kNoPin;
+}
+
+uint8_t nodeWithRole(const ProbeMapping &m, NodeRole role) {
+  const int n = probeNodeWithRole(m, role);
+  return n >= 0 ? static_cast<uint8_t>(n) : kNoPin;
 }
 
 // ---- Capabilities and the attempt list -------------------------------------
 
 // The only capability combinations the engine knows how to prepare.
 bool supported(const DriverRequirements &r) {
-  return (r.topology == ProbeTopology::ThreeWirePowered &&
-          r.excitation == ExcitationPolicy::ProtectedActive) ||
-         (r.topology == ProbeTopology::TwoTerminal &&
-          r.excitation == ExcitationPolicy::WeakPullOnly);
+  switch (r.topology) {
+    case ProbeTopology::ThreeWirePowered:
+    case ProbeTopology::FourWirePowered:
+      return r.excitation == ExcitationPolicy::ProtectedActive;
+    case ProbeTopology::TwoTerminal:
+      return r.excitation == ExcitationPolicy::WeakPullOnly;
+  }
+  return false;
 }
 
 bool topologyEnabled(ProbeTopology t) {
-  return t == ProbeTopology::ThreeWirePowered ? PINDEX_POWERED_PROBING_ENABLED != 0
-                                              : PINDEX_PASSIVE_PROBING_ENABLED != 0;
+  return t == ProbeTopology::TwoTerminal ? PINDEX_PASSIVE_PROBING_ENABLED != 0
+                                         : PINDEX_POWERED_PROBING_ENABLED != 0;
+}
+
+// FourWirePowered needs a backend that reports the baseline plus the
+// driver's own needs. Nothing else (no config flag) can grant them.
+bool backendProvides(const DriverRequirements &r) {
+  if (r.topology != ProbeTopology::FourWirePowered) return true;
+  const uint16_t needed = kBackendFourWireBaseline | r.backendCapabilities;
+  return (fourWireBackendCapabilities() & needed) == needed;
+}
+
+bool runnable(const DriverRequirements &r) {
+  return supported(r) && topologyEnabled(r.topology) && backendProvides(r);
+}
+
+// First enabled, supported driver that runnable() excludes for lack of
+// backend capabilities (reported as "hardware required"), or nullptr.
+const char *hardwareRequiredDriver() {
+  for (size_t i = 0; i < sensorDriverCount(); i++) {
+    const SensorDriver *d = sensorDriverAt(i);
+    const DriverRequirements &r = d->getRequirements();
+    if (supported(r) && topologyEnabled(r.topology) && !backendProvides(r)) return d->getName();
+  }
+  return nullptr;
 }
 
 size_t slotCount(ProbeTopology t) {
-  return t == ProbeTopology::ThreeWirePowered ? PROBE_PERMUTATION_COUNT : PROBE_PAIR_COUNT;
+  switch (t) {
+    case ProbeTopology::ThreeWirePowered: return PROBE_PERMUTATION_COUNT;
+    case ProbeTopology::FourWirePowered: return PROBE_FOUR_WIRE_COUNT;
+    case ProbeTopology::TwoTerminal: break;
+  }
+  return PROBE_PAIR_COUNT;
 }
 
 const ProbeMapping &slotMapping(ProbeTopology t, size_t slot) {
-  return t == ProbeTopology::ThreeWirePowered ? PROBE_PERMUTATIONS[slot] : PROBE_PAIRS[slot];
+  switch (t) {
+    case ProbeTopology::ThreeWirePowered: return PROBE_PERMUTATIONS[slot];
+    case ProbeTopology::FourWirePowered: return PROBE_FOUR_WIRE_MAPPINGS[slot];
+    case ProbeTopology::TwoTerminal: break;
+  }
+  return PROBE_PAIRS[slot];
 }
 
 size_t driverCount(ProbeTopology t) {
-  if (!topologyEnabled(t)) return 0;
   size_t count = 0;
   for (size_t i = 0; i < sensorDriverCount(); i++) {
     const DriverRequirements &r = sensorDriverAt(i)->getRequirements();
-    if (supported(r) && r.topology == t) count++;
+    if (r.topology == t && runnable(r)) count++;
   }
   return count;
 }
@@ -166,7 +267,7 @@ SensorDriver *driverOfTopology(ProbeTopology t, size_t nth) {
   for (size_t i = 0; i < sensorDriverCount(); i++) {
     SensorDriver *d = sensorDriverAt(i);
     const DriverRequirements &r = d->getRequirements();
-    if (supported(r) && r.topology == t && nth-- == 0) return d;
+    if (r.topology == t && runnable(r) && nth-- == 0) return d;
   }
   return nullptr;
 }
@@ -177,8 +278,9 @@ size_t attemptTotal() {
   return total;
 }
 
-// Within a topology: slot-major (every driver on a permutation or pair, in
-// registry order, before the next one). Pairs are enumerated once per cycle.
+// Within a topology: slot-major (every driver on a mapping or pair, in
+// registry order, before the next one). Pairs are enumerated once per
+// cycle; a pair's two orientations are the driver's business.
 bool attemptAt(size_t index, Attempt &out) {
   for (ProbeTopology t : kTopologyOrder) {
     const size_t drivers = driverCount(t);
@@ -206,35 +308,54 @@ SensorDriver *currentDriver() {
   return attemptAt(attemptIndex, a) ? a.driver : nullptr;
 }
 
-// Powered drive is never applied across an observed coupled path: the VCC
-// node must show no coupling to either other node. DATA-GND coupling has no
-// opposing strong drives (GND sinks; DATA is only pulled up or sunk).
-bool vccPathsUncoupled(const ProbeMapping &m, uint8_t coupled) {
-  const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
-  if (vcc < 0) return false;
+// Powered drive is never applied across an observed coupled path. A driven
+// node must show no coupling to any other node (the unused one included):
+//   * VCC always (supply into a low-impedance path);
+//   * four-wire SIG1/SIG2 too: SIG1 is host-driven and SIG2 sensor-driven,
+//     so coupling to anything is contention. With GND the only undriven
+//     role, any coupling at all vetoes a four-wire mapping.
+// Three-wire DATA-GND coupling has no opposing strong drives (GND sinks;
+// DATA is only pulled up or sunk), as before. No coupling seen is NOT
+// permission: that comes from the protected interface, never the precheck.
+bool drivenPathsUncoupled(const ProbeMapping &m, uint8_t coupled) {
+  if (probeNodeWithRole(m, NodeRole::Vcc) < 0) return false;
   for (uint8_t n = 0; n < PROBE_NODE_COUNT; n++) {
-    if (n != vcc && (coupled & probePairBit(static_cast<uint8_t>(vcc), n)) != 0) return false;
+    const NodeRole role = m.role[n];
+    if (role != NodeRole::Vcc && role != NodeRole::Sig1 && role != NodeRole::Sig2) continue;
+    for (uint8_t k = 0; k < PROBE_NODE_COUNT; k++) {
+      if (k != n && (coupled & probePairBit(n, k)) != 0) return false;
+    }
   }
   return true;
 }
 
-bool attemptPermitted(const DriverRequirements &r, const ProbeMapping &m) {
-  if (!supported(r) || r.topology != m.topology || !topologyEnabled(r.topology)) return false;
-  if (r.excitation == ExcitationPolicy::ProtectedActive) {
-    return vccPathsUncoupled(m, status.coupledPairs);
+// nullptr if the attempt may be prepared, else why not.
+const char *attemptBlockReason(const DriverRequirements &r, const ProbeMapping &m) {
+  if (!supported(r) || r.topology != m.topology || !topologyEnabled(r.topology)) return "not-permitted";
+  if (!backendProvides(r)) return "hardware-required";
+  if (r.excitation == ExcitationPolicy::ProtectedActive && !drivenPathsUncoupled(m, status.coupledPairs)) {
+    return "blocked-by-precheck";
   }
-  return true;  // WeakPullOnly: coupling is exactly what it measures
+  return nullptr;  // WeakPullOnly: coupling is exactly what it measures
 }
 
 ProbeContext contextFor(const ProbeMapping &m) {
   ProbeContext c{};
   c.topology = m.topology;
-  if (m.topology == ProbeTopology::ThreeWirePowered) {
-    c.powered = {gpioWithRole(m, NodeRole::Vcc), gpioWithRole(m, NodeRole::Data),
-                 gpioWithRole(m, NodeRole::Gnd)};
-  } else {
-    c.pair = {gpioWithRole(m, NodeRole::Terminal, 0), gpioWithRole(m, NodeRole::Terminal, 1),
-              gpioWithRole(m, NodeRole::Unused)};
+  switch (m.topology) {
+    case ProbeTopology::ThreeWirePowered:
+      c.powered = {gpioWithRole(m, NodeRole::Vcc), gpioWithRole(m, NodeRole::Data),
+                   gpioWithRole(m, NodeRole::Gnd)};
+      break;
+    case ProbeTopology::FourWirePowered:
+      c.fourWire = {gpioWithRole(m, NodeRole::Vcc), gpioWithRole(m, NodeRole::Sig1),
+                    gpioWithRole(m, NodeRole::Sig2), gpioWithRole(m, NodeRole::Gnd)};
+      break;
+    case ProbeTopology::TwoTerminal:
+      c.pair.first = gpioWithRole(m, NodeRole::Terminal, 0);
+      c.pair.second = gpioWithRole(m, NodeRole::Terminal, 1);
+      for (int i = 0; i < PROBE_NODE_COUNT - 2; i++) c.pair.unused[i] = gpioWithRole(m, NodeRole::Unused, i);
+      break;
   }
   return c;
 }
@@ -252,6 +373,7 @@ void driveNode(uint8_t node, uint8_t level) {
 }
 
 // ThreeWirePowered only; any other mapping leaves every node plain INPUT.
+// The fourth node stays plain INPUT.
 void powerUp(const ProbeMapping &m) {
   resetTestPins();
   const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
@@ -263,9 +385,11 @@ void powerUp(const ProbeMapping &m) {
   pinMode(gpio(static_cast<uint8_t>(data)), INPUT_PULLUP);
 }
 
-// Powered mappings: DATA first (no pull-up or drive left to back-power the
-// part through its DATA pin), then VCC, then every node including GND.
-// Anything else: every node straight to plain INPUT.
+// Three-wire: DATA first (no pull-up or drive left to back-power the part
+// through its DATA pin), then VCC, then every node including GND.
+// Anything else: every node to plain INPUT. resetTestPins() then switches
+// the four-wire backend off, so a four-wire part loses its signals before
+// its supply and ground.
 void teardown(const ProbeMapping *m) {
   if (m != nullptr && m->topology == ProbeTopology::ThreeWirePowered) {
     const int data = probeNodeWithRole(*m, NodeRole::Data);
@@ -276,15 +400,19 @@ void teardown(const ProbeMapping *m) {
   resetTestPins();
 }
 
-// The VCC-HIGH/GND-LOW path runs only for ProtectedActive drivers; a
-// WeakPullOnly driver gets every node as plain INPUT and excites its pair
-// itself (pull-up + open-drain LOW sink only).
-void prepareExcitation(const DriverRequirements &r, const ProbeMapping &m) {
-  if (r.excitation == ExcitationPolicy::ProtectedActive) {
+// Three-wire ProtectedActive: GPIO power-up. Four-wire: every GPIO plain
+// INPUT and the backend off (break), then the backend routes this mapping
+// (make); false if it refuses. WeakPullOnly: every node plain INPUT; the
+// driver excites its pair itself (pull-up + open-drain LOW sink only).
+bool prepareExcitation(const DriverRequirements &r, const ProbeMapping &m) {
+  if (r.topology == ProbeTopology::ThreeWirePowered) {
     powerUp(m);
-  } else {
-    resetTestPins();
+    return true;
   }
+  resetTestPins();
+  if (r.topology != ProbeTopology::FourWirePowered) return true;
+  return fourWireBackendConnect(nodeWithRole(m, NodeRole::Vcc), nodeWithRole(m, NodeRole::Sig1),
+                                nodeWithRole(m, NodeRole::Sig2), nodeWithRole(m, NodeRole::Gnd));
 }
 
 // ---- Result bookkeeping -----------------------------------------------------
@@ -294,6 +422,7 @@ void clearResult() {
   savedDriver = nullptr;
   status.hasMapping = false;
   status.mapping = ProbeMapping{};
+  status.signalLabel[0] = status.signalLabel[1] = nullptr;
   status.componentName = nullptr;
   status.detected = false;
   status.readingValid = false;
@@ -301,6 +430,17 @@ void clearResult() {
   status.telemetry1[0] = '\0';
   status.telemetry2[0] = '\0';
   status.consecutiveFailures = 0;
+  confirmations = 0;
+}
+
+// Keeps `driver` on `m` as the candidate; confirmation starts from zero.
+void saveCandidate(SensorDriver *driver, const ProbeMapping &m) {
+  const DriverRequirements &r = driver->getRequirements();
+  savedDriver = driver;
+  status.mapping = m;
+  status.hasMapping = true;
+  status.signalLabel[0] = r.signalLabel[0];
+  status.signalLabel[1] = r.signalLabel[1];
   confirmations = 0;
 }
 
@@ -406,6 +546,7 @@ void startDiscovery(uint32_t now) {
   twoTerminalHits = 0;
   cycleMeasurementError = false;
   status.measurementUnavailable = false;
+  status.hardwareRequired = hardwareRequiredDriver();  // skipped, never a scan fault
   if (attemptTotal() == 0) {  // nothing to try: never precheck or excite
     noComponent = true;
     goIdle(now, PROBE_RESCAN_INTERVAL_MS);
@@ -420,17 +561,14 @@ void finishCycle(uint32_t now) {
     // Exactly one pair behaved as a two-terminal part: make it the
     // candidate and re-probe it from a fresh precheck (the scan result
     // itself is not reused as a confirming acquisition).
-    savedDriver = hit.driver;
-    status.mapping = *hit.mapping;
-    status.hasMapping = true;
+    saveCandidate(hit.driver, *hit.mapping);
     status.componentName = hit.driver->getName();
     status.consecutiveFailures = 0;
-    confirmations = 0;
     enter(State::PowerOffWait, now);
     return;
   }
   noComponent = true;
-  if (twoTerminalHits > 1) status.lastError = "ambiguous-pairs";  // 3-node coupling
+  if (twoTerminalHits > 1) status.lastError = "ambiguous-pairs";  // multi-node coupling
   status.measurementUnavailable = cycleMeasurementError && twoTerminalHits == 0;
   goIdle(now, PROBE_RESCAN_INTERVAL_MS);
 }
@@ -449,10 +587,11 @@ void advanceAttempt(uint32_t now, bool energised) {
   finishCycle(now);
 }
 
-// The precheck forbids this attempt (coupled VCC path or disabled topology).
-void onAttemptBlocked(uint32_t now) {
+// The attempt is not permitted (coupled driven path, missing backend
+// capability, disabled topology); nothing was energised.
+void onAttemptBlocked(uint32_t now, const char *reason) {
   if (savedDriver != nullptr) {
-    onAttemptFailed(now, "blocked-by-precheck");  // never powered across it
+    onAttemptFailed(now, reason);  // never powered across it
     return;
   }
   advanceAttempt(now, false);
@@ -469,7 +608,7 @@ void onProbeSucceeded(SensorDriver *driver, uint32_t now) {
   status.lastError = nullptr;
   if (savedDriver == nullptr && driver->getRequirements().topology == ProbeTopology::TwoTerminal) {
     // Two-terminal results are judged over every pair before one is
-    // published, so a conducting pair is never reported while the third
+    // published, so a conducting pair is never reported while another
     // node is also coupled.
     twoTerminalHits++;
     twoTerminalHitIndex = attemptIndex;
@@ -478,13 +617,7 @@ void onProbeSucceeded(SensorDriver *driver, uint32_t now) {
     advanceAttempt(now, true);
     return;
   }
-  if (savedDriver == nullptr) {  // first success: keep candidate, stop scanning
-    const ProbeMapping *m = currentMapping();
-    savedDriver = driver;
-    status.mapping = *m;
-    status.hasMapping = true;
-    confirmations = 0;
-  }
+  if (savedDriver == nullptr) saveCandidate(driver, *currentMapping());  // stop scanning
   status.componentName = driver->getName();
   countConfirmation();
   // The mapping stays prepared; telemetry arrives with the next readSample().
@@ -523,7 +656,8 @@ void onAttemptFailed(uint32_t now, const char *reason) {
     enter(State::RetryWait, now);  // retry only the saved driver and mapping
     return;
   }
-  // No removal sensor exists: removal is inferred from failed acquisitions.
+  // No removal sensor exists: loss of response (removal, or e.g. no echo
+  // target) is inferred from failed acquisitions, never proven.
   clearResult();
   goIdle(now, PROBE_RESCAN_INTERVAL_MS);
 }
@@ -583,11 +717,14 @@ void step(uint32_t now) {
         enterFault(now);
         break;
       }
-      if (!attemptPermitted(driver->getRequirements(), *m)) {
-        onAttemptBlocked(now);
+      if (const char *blocked = attemptBlockReason(driver->getRequirements(), *m)) {
+        onAttemptBlocked(now, blocked);
         break;
       }
-      prepareExcitation(driver->getRequirements(), *m);
+      if (!prepareExcitation(driver->getRequirements(), *m)) {
+        onAttemptFailed(now, "backend-refused");  // torn down; next attempt or retry
+        break;
+      }
       enter(State::Stabilizing, now);
       break;
     }
@@ -664,41 +801,54 @@ bool sameMapping(const ProbeMapping &a, const ProbeMapping &b) {
 bool sameForDisplay(const ProbeStatus &a, const ProbeStatus &b) {
   return a.phase == b.phase && a.scanIndex == b.scanIndex && a.scanTotal == b.scanTotal &&
          a.hasMapping == b.hasMapping && sameMapping(a.mapping, b.mapping) &&
+         sameText(a.signalLabel[0], b.signalLabel[0]) && sameText(a.signalLabel[1], b.signalLabel[1]) &&
          sameText(a.componentName, b.componentName) && a.detected == b.detected &&
          a.readingValid == b.readingValid && a.readingStale == b.readingStale &&
          sameText(a.telemetry1, b.telemetry1) && sameText(a.telemetry2, b.telemetry2) &&
          a.consecutiveFailures == b.consecutiveFailures && sameText(a.lastError, b.lastError) &&
          a.precheck == b.precheck && a.coupledPairs == b.coupledPairs &&
-         a.measurementUnavailable == b.measurementUnavailable;
+         a.measurementUnavailable == b.measurementUnavailable &&
+         sameText(a.hardwareRequired, b.hardwareRequired);
 }
 
 void publish(const ProbeStatus &before) {
   status.phase = derivePhase();
-  status.scanTotal = static_cast<uint8_t>(attemptTotal());
+  status.scanTotal = static_cast<uint16_t>(attemptTotal());
   status.scanIndex = status.phase == ProbePhase::Scanning && attemptIndex < status.scanTotal
-                         ? static_cast<uint8_t>(attemptIndex + 1)
+                         ? static_cast<uint16_t>(attemptIndex + 1)
                          : 0;
   if (!sameForDisplay(before, status)) status.revision++;
 }
 
-const char *roleName(NodeRole role) {
+const char *roleName(NodeRole role, const char *const *signalLabel) {
   switch (role) {
     case NodeRole::Vcc: return "VCC";
     case NodeRole::Data: return "DAT";
     case NodeRole::Gnd: return "GND";
     case NodeRole::Terminal: return "T";
+    case NodeRole::Sig1: return signalLabel != nullptr && signalLabel[0] != nullptr ? signalLabel[0] : "S1";
+    case NodeRole::Sig2: return signalLabel != nullptr && signalLabel[1] != nullptr ? signalLabel[1] : "S2";
     case NodeRole::Unused: break;
   }
   return "---";
+}
+
+// Appends "X:role" to buf, space-separated; truncates, always terminated.
+void appendNode(char *buf, size_t len, int node, const char *role) {
+  const size_t used = strlen(buf);
+  if (used + 1 < len) {
+    snprintf(buf + used, len - used, "%s%c:%s", used > 0 ? " " : "", PROBE_NODE_LABEL[node], role);
+  }
 }
 
 }  // namespace
 
 void resetTestPins() {
   // Plain INPUT: output driver off, internal pull-up and pull-down off.
-  pinMode(PROBE_PIN_A, INPUT);
-  pinMode(PROBE_PIN_B, INPUT);
-  pinMode(PROBE_PIN_C, INPUT);
+  for (uint8_t pin : PROBE_NODE_GPIO) pinMode(pin, INPUT);
+  // Then the external four-wire supply and routes, after the signals, so a
+  // part is never back-fed from a GPIO once unpowered.
+  fourWireBackendDisconnect();
 }
 
 void initProbeEngine() {
@@ -715,6 +865,7 @@ void initProbeEngine() {
   noComponent = false;
   twoTerminalHits = 0;
   cycleMeasurementError = false;
+  status.hardwareRequired = hardwareRequiredDriver();
 
   if (PINDEX_POWERED_PROBING_ENABLED || PINDEX_PASSIVE_PROBING_ENABLED) {
     goIdle(now, 0);  // discovery starts on the first tick
@@ -755,19 +906,22 @@ bool probeSendCommand(char command) {
   return savedDriver->handleUserCommand(command);
 }
 
-void formatProbeMapping(const ProbeMapping &mapping, char *buf, size_t len) {
-  if (mapping.topology == ProbeTopology::TwoTerminal) {
-    const int t0 = probeNodeWithRole(mapping, NodeRole::Terminal, 0);
-    const int t1 = probeNodeWithRole(mapping, NodeRole::Terminal, 1);
-    const int unused = probeNodeWithRole(mapping, NodeRole::Unused);
-    if (t0 >= 0 && t1 >= 0 && unused >= 0) {
-      snprintf(buf, len, "Pins: %c & %c, %c:---", kNodeLabel[t0], kNodeLabel[t1],
-               kNodeLabel[unused]);
-      return;
+void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLabel, char *first,
+                        char *second, size_t len) {
+  if (len == 0) return;
+  first[0] = second[0] = '\0';
+  const int t0 = probeNodeWithRole(mapping, NodeRole::Terminal, 0);
+  const int t1 = probeNodeWithRole(mapping, NodeRole::Terminal, 1);
+  if (mapping.topology == ProbeTopology::TwoTerminal && t0 >= 0 && t1 >= 0) {
+    snprintf(first, len, "Pins: %c & %c", PROBE_NODE_LABEL[t0], PROBE_NODE_LABEL[t1]);
+    for (int n = 0; n < PROBE_NODE_COUNT; n++) {
+      if (mapping.role[n] == NodeRole::Unused) appendNode(second, len, n, "---");
     }
+    return;
   }
-  snprintf(buf, len, "%c:%s | %c:%s | %c:%s", kNodeLabel[0], roleName(mapping.role[0]),
-           kNodeLabel[1], roleName(mapping.role[1]), kNodeLabel[2], roleName(mapping.role[2]));
+  for (int n = 0; n < PROBE_NODE_COUNT; n++) {  // A, B on the first half; C, D on the second
+    appendNode(n < PROBE_NODE_COUNT / 2 ? first : second, len, n, roleName(mapping.role[n], signalLabel));
+  }
 }
 
 const char *probePhaseName(ProbePhase phase) {

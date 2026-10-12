@@ -14,10 +14,16 @@
 #define OLED_HEIGHT 64
 #define OLED_SPI_FREQUENCY_HZ 8000000UL
 
-// Probe test nodes (not fixed VCC/GND/signal terminals).
+// Probe socket: four generic test nodes (not fixed VCC/GND/signal
+// terminals) in external socket order A, B, C, D. These are GPIO labels;
+// they are not in this order, or adjacent, on every DevKit header. The
+// node table in probe_engine.cpp is the only node-to-GPIO mapping.
+// GPIO25/26/27 are ADC2 channels; GPIO33 is ADC1 (passive_adc.cpp).
 #define PROBE_PIN_A 25
 #define PROBE_PIN_B 26
 #define PROBE_PIN_C 27
+#define PROBE_PIN_D 33
+#define PROBE_NODE_COUNT 4
 
 #define HEARTBEAT_INTERVAL_MS 1000UL
 #define SPLASH_DURATION_MS 1500UL
@@ -25,13 +31,18 @@
 #define PINDEX_VERSION "0.2"
 
 // ---------------------------------------------------------------------------
-// Powered probing (Phase 2: DHT11-compatible detection)
+// Powered probing (three-wire DHT11 and four-wire ultrasonic detection)
 // ---------------------------------------------------------------------------
-// 0: no probe GPIO is ever driven as VCC/GND (passive weak-pull probing is
-// controlled separately below; both 0 = probes stay plain INPUT and the
-// display shows "Probing disabled"). 1: run the six-permutation powered
-// scan, driving probe GPIOs as a nominal 3.3V supply where the precheck
-// shows no coupling on the VCC node.
+// 0: nothing is ever powered and no probe GPIO is driven as VCC/GND or a
+// trigger (passive weak-pull probing is controlled separately below; both
+// 0 = probes stay plain INPUT and the display shows "Probing disabled").
+// 1: run the powered scans:
+//   * three-wire (24 mappings): probe GPIOs driven as a nominal 3.3V
+//     supply where the precheck shows no coupling on the VCC node;
+//   * four-wire (24 mappings): ONLY if the protected four-wire backend
+//     (four_wire_backend.h) reports the capabilities the driver needs. The
+//     shipped backend reports none, so no four-wire attempt runs; this
+//     setting cannot enable that hardware.
 // Setting 1 is a DEPLOYMENT PREREQUISITE, NOT A SAFETY MECHANISM. Only enable
 // it behind a reviewed interface with current limiting, fault handling and
 // protection against wrong polarity and pin assignment (see README).
@@ -64,7 +75,7 @@
 #define PROBE_RETRY_COOLDOWN_MS 1000UL   // after a failed read on the saved mapping
 #define PROBE_RESCAN_INTERVAL_MS 5000UL  // idle time before discovery restarts
 #define PROBE_CONFIRM_FRAMES 2           // consecutive valid frames to publish
-#define PROBE_MAX_CONSECUTIVE_FAILURES 3 // then removal is inferred
+#define PROBE_MAX_CONSECUTIVE_FAILURES 3 // then loss of response (e.g. removal) is inferred
 
 // DHT11 driver (src/drivers/dht11_driver.cpp): requirements and protocol timing.
 #define DHT_POWER_STABILIZE_MS 1100UL    // power-up to first start request
@@ -81,6 +92,22 @@
 #define DHT_BIT_HIGH_MIN_US 10           // bit HIGH phase: ~27 us = 0, ~70 us = 1
 #define DHT_BIT_HIGH_MAX_US 100
 #define DHT_BIT_THRESHOLD_US 50          // HIGH longer than this decodes as 1
+
+// HC-SR04-compatible ultrasonic driver (src/drivers/ultrasonic_driver.cpp).
+// Runs only behind a protected four-wire backend (see README): the module
+// needs a 5V supply and returns a 5V ECHO.
+#define ULTRASONIC_POWER_STABILIZE_MS 200UL   // backend power-on to first trigger. An
+                                              // engineering choice, NOT a datasheet figure:
+                                              // validate on the actual module
+#define ULTRASONIC_TRIGGER_PULSE_US 10UL      // TRIG HIGH width (HC-SR04 needs >= 10 us)
+#define ULTRASONIC_ECHO_DEADLINE_US 25000UL   // trigger release to ECHO falling edge, one budget
+#define ULTRASONIC_MIN_INTERVAL_MS 70UL       // trigger to trigger, incl. retries
+#define ULTRASONIC_SAMPLE_INTERVAL_MS 100UL   // monitoring cadence, start to start
+#define ULTRASONIC_OPERATION_TIMEOUT_MS 300UL // engine abandons a still-pending operation
+#define ULTRASONIC_CONFIRM_SAMPLES 2          // consecutive fresh valid echoes per probe()
+#define ULTRASONIC_US_PER_CM 58.0f            // round-trip echo time per cm
+#define ULTRASONIC_MIN_DISTANCE_CM 2.0f       // accepted range, inclusive
+#define ULTRASONIC_MAX_DISTANCE_CM 300.0f
 
 // Supported DHT11 profile: plausibility window for decoded values.
 #define DHT11_HUMIDITY_MIN_PCT 5

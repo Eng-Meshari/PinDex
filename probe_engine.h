@@ -1,35 +1,50 @@
-// Probe engine for the A/B/C test nodes. Owns the probe GPIOs, the
-// precheck routing policy, power sequencing and all detection policy;
-// sensor protocols live in drivers (sensor_driver.h, src/drivers/).
-// With PINDEX_POWERED_PROBING_ENABLED and PINDEX_PASSIVE_PROBING_ENABLED
-// both 0 it only keeps the probes as high-impedance inputs.
+// Probe engine for the A/B/C/D test nodes. Owns the probe GPIOs, the
+// precheck routing policy, power sequencing (including the four-wire
+// backend) and all detection policy; sensor protocols live in drivers
+// (sensor_driver.h, src/drivers/). With PINDEX_POWERED_PROBING_ENABLED and
+// PINDEX_PASSIVE_PROBING_ENABLED both 0 it only keeps the probes as
+// high-impedance inputs.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
+#include "config.h"
 #include "sensor_driver.h"
 
-#define PROBE_NODE_COUNT 3
-#define PROBE_PERMUTATION_COUNT 6
-#define PROBE_PAIR_COUNT 3
-#define PROBE_MAPPING_TEXT_LEN 22    // "A:VCC | B:DAT | C:GND" + NUL
+#define PROBE_PERMUTATION_COUNT 24   // three-wire: ordered VCC/DATA/GND on 3 of 4 nodes
+#define PROBE_FOUR_WIRE_COUNT 24     // four-wire: ordered VCC/SIG1/SIG2/GND on all 4 nodes
+#define PROBE_PAIR_COUNT 6           // two-terminal: unordered node pairs
+#define PROBE_MAPPING_TEXT_LEN 16    // one half of the mapping text, "A:VCC B:TRG" + NUL
 #define PROBE_TELEMETRY_TEXT_LEN 22  // one OLED line (21 glyphs) + NUL
 
 // What each physical socket node does in one attempt.
-enum class NodeRole : uint8_t { Unused, Vcc, Data, Gnd, Terminal };
+enum class NodeRole : uint8_t { Unused, Vcc, Data, Gnd, Terminal, Sig1, Sig2 };
 
-// Roles of nodes A, B, C (index 0, 1, 2). Socket labels stay separate from
+// Roles of nodes A, B, C, D (index 0..3). Socket labels stay separate from
 // GPIO numbers; the engine resolves GPIOs per node.
 struct ProbeMapping {
   ProbeTopology topology;
   NodeRole role[PROBE_NODE_COUNT];
 };
 
-// Powered scan order, fixed: 1 ABC, 2 CBA, 3 BAC, 4 BCA, 5 ACB, 6 CAB (VCC DATA GND).
+// The canonical node table: node i is labelled PROBE_NODE_LABEL[i] on the
+// socket and wired to GPIO PROBE_NODE_GPIO[i].
+extern const uint8_t PROBE_NODE_GPIO[PROBE_NODE_COUNT];
+extern const char PROBE_NODE_LABEL[PROBE_NODE_COUNT];
+
+// Three-wire scan order, fixed: the original six A/B/C permutations first
+// (1 ABC, 2 CBA, 3 BAC, 4 BCA, 5 ACB, 6 CAB as VCC DATA GND), then the same
+// six patterns on the node sets ABD (7-12), ACD (13-18) and BCD (19-24).
+// The fourth node is unused.
 extern const ProbeMapping PROBE_PERMUTATIONS[PROBE_PERMUTATION_COUNT];
 
-// Two-terminal pairs, in order A-B, B-C, A-C; the third node is unused.
+// Four-wire scan order: every assignment of A..D to (VCC, SIG1, SIG2, GND),
+// lexicographic by node: ABCD, ABDC, ACBD, ... DCBA.
+extern const ProbeMapping PROBE_FOUR_WIRE_MAPPINGS[PROBE_FOUR_WIRE_COUNT];
+
+// Two-terminal pairs: A-B, B-C, A-C (the original order), then A-D, B-D,
+// C-D; the other two nodes are unused.
 extern const ProbeMapping PROBE_PAIRS[PROBE_PAIR_COUNT];
 
 // Bit i of ProbeStatus::coupledPairs refers to PROBE_PAIRS[i].
@@ -62,10 +77,11 @@ enum class PrecheckResult : uint8_t {
 // nothing here can trigger an acquisition.
 struct ProbeStatus {
   ProbePhase phase;
-  uint8_t scanIndex;             // attempt 1..scanTotal while scanning, else 0
-  uint8_t scanTotal;             // attempts per discovery cycle
+  uint16_t scanIndex;            // attempt 1..scanTotal while scanning, else 0
+  uint16_t scanTotal;            // attempts per discovery cycle
   bool hasMapping;               // candidate or detected mapping saved
   ProbeMapping mapping;
+  const char *signalLabel[2];    // SIG1/SIG2 names of a four-wire mapping (driver's), else nullptr
   const char *componentName;     // driver getName() of the candidate/active driver, or nullptr
   bool detected;                 // PROBE_CONFIRM_FRAMES consecutive acquisitions
   bool readingValid;             // telemetry holds a completed sample
@@ -78,6 +94,8 @@ struct ProbeStatus {
   PrecheckResult precheck;       // latest completed precheck
   uint8_t coupledPairs;          // pairs the latest precheck saw coupled
   bool measurementUnavailable;   // last cycle failed on measurement errors (e.g. ADC)
+  const char *hardwareRequired;  // first enabled driver skipped because the four-wire
+                                 // backend lacks capabilities it needs, or nullptr
   uint32_t revision;             // changes whenever a displayed field changes
 };
 
@@ -85,7 +103,8 @@ struct ProbeStatus {
 // starts the engine (Disabled or Idle).
 void initProbeEngine();
 
-// Sets every probe pin to plain INPUT (no pull-up/pull-down). Idempotent.
+// Sets every probe pin to plain INPUT (no pull-up/pull-down), then switches
+// the four-wire backend off (supply off, routes open). Idempotent.
 void resetTestPins();
 
 // Advances the state machine; call on every loop() iteration. Never blocks
@@ -108,8 +127,15 @@ bool probeRequestClear();
 // detected or it did not accept the command.
 bool probeSendCommand(char command);
 
-// "A:VCC | B:DAT | C:GND" or "Pins: A & B, C:---", always in A/B/C order.
-void formatProbeMapping(const ProbeMapping &mapping, char *buf, size_t len);
+// Mapping text in socket order, as two halves that each fit one OLED line
+// (the joined four-node text does not, at the size-1 font):
+//   four-wire  "A:VCC B:TRG" + "C:ECH D:GND"  (SIG names from signalLabel,
+//                                              "S1"/"S2" if null)
+//   three-wire "A:VCC B:DAT" + "C:GND D:---"
+//   pair       "Pins: A & B" + "C:--- D:---"
+// len is the capacity of each buffer; both are always terminated.
+void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLabel, char *first,
+                        char *second, size_t len);
 
 const char *probePhaseName(ProbePhase phase);
 const char *precheckResultName(PrecheckResult result);

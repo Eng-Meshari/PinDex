@@ -18,12 +18,25 @@
 #define OPEN_DRAIN 0x10
 #define OUTPUT_OPEN_DRAIN 0x13
 #define ANALOG 0xC0  // used by the simulated ADC adapter to mark a sensed pad
+#define RISING 0x01
+#define FALLING 0x02
+#define CHANGE 0x03
+#define ARDUINO_ISR_ATTR
 
 namespace mock {
 
 struct Pin {
   uint8_t mode;  // 0 = never configured
   uint8_t latch;
+};
+
+// attachInterruptArg() registrations. As on the core, pinMode() leaves them
+// alone; only detachInterrupt() removes one. Tests deliver edges with
+// fireInterrupt().
+struct Isr {
+  void (*fn)(void *);
+  void *arg;
+  int mode;
 };
 
 struct Event {
@@ -47,6 +60,9 @@ inline uint64_t criticalSinceUs = 0;
 inline uint64_t criticalMaxUs = 0;
 inline int (*readHook)(uint8_t pin) = nullptr;  // -1 = use the pin's own level
 inline void (*changeHook)(uint8_t pin, bool isPinMode) = nullptr;
+inline Isr isr[64];
+inline int isrCalls = 0;
+inline int attachCalls = 0;
 
 inline bool isOutput(uint8_t pin) { return (pins[pin].mode & OUTPUT) == OUTPUT; }
 inline bool drivesHigh(uint8_t pin) {
@@ -79,6 +95,18 @@ inline void reset(uint64_t startUs) {
   criticalMaxUs = 0;
   readHook = nullptr;
   changeHook = nullptr;
+  for (Isr &i : isr) i = Isr{nullptr, nullptr, 0};
+  isrCalls = 0;
+  attachCalls = 0;
+}
+
+// Runs the handler attached to `pin` (an edge the hardware would report),
+// with the clock at the edge. False if nothing is attached.
+inline bool fireInterrupt(uint8_t pin) {
+  if (isr[pin].fn == nullptr) return false;
+  isrCalls++;
+  isr[pin].fn(isr[pin].arg);
+  return true;
 }
 
 }  // namespace mock
@@ -125,3 +153,13 @@ inline void portEXIT_CRITICAL(portMUX_TYPE *) {
     if (held > mock::criticalMaxUs) mock::criticalMaxUs = held;
   }
 }
+
+inline void portENTER_CRITICAL_ISR(portMUX_TYPE *mux) { portENTER_CRITICAL(mux); }
+inline void portEXIT_CRITICAL_ISR(portMUX_TYPE *mux) { portEXIT_CRITICAL(mux); }
+
+inline void attachInterruptArg(uint8_t pin, void (*fn)(void *), void *arg, int mode) {
+  mock::isr[pin] = mock::Isr{fn, arg, mode};
+  mock::attachCalls++;
+}
+
+inline void detachInterrupt(uint8_t pin) { mock::isr[pin] = mock::Isr{nullptr, nullptr, 0}; }

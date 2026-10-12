@@ -1,20 +1,26 @@
-// Abstract sensor driver contract for the three-node (A/B/C) socket.
+// Abstract sensor driver contract for the four-node (A/B/C/D) socket.
 //
 // Ownership: the probe engine owns pin permission, prechecks, which nodes
-// an attempt may use, VCC/GND power sequencing (powered topology only),
-// teardown, scheduling, confirmation and removal policy. A driver owns only
-// the signalling it needs on the nodes handed to it in a ProbeContext:
-// protocol timing, capture, decoding, validation, its own sample storage
-// and telemetry formatting. A driver never powers VCC/GND, picks other
-// nodes, touches the OLED or modifies engine state.
+// an attempt may use, power sequencing (GPIO VCC/GND for three-wire, the
+// protected backend for four-wire), teardown, scheduling, confirmation and
+// removal policy. A driver owns only the signalling it needs on the nodes
+// handed to it in a ProbeContext: protocol timing, capture, decoding,
+// validation, its own sample storage and telemetry formatting. A driver
+// never powers VCC/GND, picks other nodes, touches the OLED or modifies
+// engine state.
 //
 // Capabilities (DriverRequirements::topology / ::excitation) decide how
 // the engine prepares an attempt; drivers are never selected by name:
 //   ThreeWirePowered + ProtectedActive: engine drives GND LOW, VCC HIGH and
-//     pulls DATA up (behind the protected interface) before probe().
+//     pulls DATA up (behind the protected interface) before probe(); the
+//     fourth node stays plain INPUT.
+//   FourWirePowered + ProtectedActive: every GPIO stays plain INPUT and the
+//     protected four-wire backend (four_wire_backend.h) routes supply and
+//     ground, only if it reports kBackendFourWireBaseline plus the driver's
+//     backendCapabilities. The driver signals on SIG1/SIG2 only.
 //   TwoTerminal + WeakPullOnly: engine powers nothing; every node is plain
-//     INPUT and the unused node stays that way. The driver may only use an
-//     internal pull-up and an open-drain LOW sink on its two terminals.
+//     INPUT and the two unused nodes stay that way. The driver may only use
+//     an internal pull-up and an open-drain LOW sink on its two terminals.
 //   Any other combination is unsupported and never attempted.
 //
 // Cooperative operations (probe() and readSample()):
@@ -30,7 +36,8 @@
 //     operation without energising anything.
 //   * readSample() needs a prior successful probe(); reset() forgets it.
 //   * Long waits return Pending. Only a short, bounded timing-critical
-//     capture may block (the DHT11 capture blocks at most 6.5 ms).
+//     capture may block (the DHT11 capture blocks at most 6.5 ms; the
+//     ultrasonic trigger pulse ~10 us, its echo is captured by interrupt).
 //
 // readSample() buffers: maxLen is the capacity of EACH buffer including the
 // terminator. Null pointers or zero capacity are rejected without being
@@ -41,11 +48,14 @@
 // reset(): idempotent; cancels any pending operation and clears protocol,
 // binding, calibration and sample state. It may only make a pin safer
 // (e.g. release a line it is holding low or a pull-up it enabled, to plain
-// INPUT); it never energises a pin and never touches another driver's pins.
+// INPUT, or detach an interrupt it attached); it never energises a pin and
+// never touches another driver's pins.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "config.h"
 
 enum class DriverOperationStatus : uint8_t {
   Idle,       // nothing started since reset()
@@ -55,14 +65,30 @@ enum class DriverOperationStatus : uint8_t {
 };
 
 enum class ProbeTopology : uint8_t {
-  ThreeWirePowered,  // VCC / DATA / GND roles over the six permutations
-  TwoTerminal,       // two terminals plus an unused node, over the three pairs
+  ThreeWirePowered,  // VCC / DATA / GND on three of the four nodes (24 mappings)
+  TwoTerminal,       // two terminals, two unused nodes (6 pairs)
+  FourWirePowered,   // VCC / SIG1 / SIG2 / GND on all four nodes (24 mappings)
 };
 
 enum class ExcitationPolicy : uint8_t {
-  ProtectedActive,  // engine-driven supply; needs the protected interface
+  ProtectedActive,  // engine-switched supply; needs the protected interface
   WeakPullOnly,     // internal pull-up + open-drain LOW sink; never drives HIGH
 };
+
+// What the protected four-wire backend actually provides, as reported by
+// fourWireBackendCapabilities(). Only the backend reports these; a config
+// flag never grants one.
+constexpr uint16_t kBackendSupply5V = 1u << 0;              // switched 5 V, current-limited, enough for the sensor
+constexpr uint16_t kBackendSupplySwitching = 1u << 1;       // supply routed to any chosen node, and off on command
+constexpr uint16_t kBackendGroundRouting = 1u << 2;         // return path routed to the chosen node only
+constexpr uint16_t kBackendSignalLevels = 1u << 3;          // no node can put more than 3.3 V on its GPIO
+constexpr uint16_t kBackendAssignmentProtection = 1u << 4;  // every wrong candidate mapping tolerated
+constexpr uint16_t kBackendBreakBeforeMake = 1u << 5;       // all routes open before a new mapping closes
+
+// Every FourWirePowered attempt needs these, whatever the sensor.
+constexpr uint16_t kBackendFourWireBaseline = kBackendSupplySwitching | kBackendGroundRouting |
+                                              kBackendSignalLevels | kBackendAssignmentProtection |
+                                              kBackendBreakBeforeMake;
 
 // Fixed per driver; the engine prepares and schedules attempts from it.
 struct DriverRequirements {
@@ -72,10 +98,12 @@ struct DriverRequirements {
   uint32_t minAcquisitionIntervalMs;  // between operation starts, incl. retries
   uint32_t sampleIntervalMs;          // readSample() cadence (never below the minimum)
   uint32_t operationTimeoutMs;        // the engine fails an operation pending this long
+  uint16_t backendCapabilities;       // FourWirePowered: kBackend* bits needed beyond the baseline; else 0
+  const char *signalLabel[2];         // FourWirePowered: display names of SIG1, SIG2 (<= 3 chars); else nullptr
 };
 
-// GPIO numbers for one attempt. Only the half matching `topology` is valid;
-// a passive terminal is never passed as "VCC".
+// GPIO numbers for one attempt. Only the member matching `topology` is
+// valid; a passive terminal is never passed as "VCC".
 struct ThreeWirePins {
   uint8_t vcc;
   uint8_t data;
@@ -85,13 +113,21 @@ struct ThreeWirePins {
 struct TwoTerminalPins {
   uint8_t first;   // terminals of the selected pair, in socket order
   uint8_t second;
-  uint8_t unused;  // plain INPUT; the driver must not touch it
+  uint8_t unused[PROBE_NODE_COUNT - 2];  // plain INPUT; the driver must not touch them
+};
+
+struct FourWirePins {
+  uint8_t vcc;   // supplied by the backend; this GPIO stays plain INPUT
+  uint8_t sig1;  // e.g. ultrasonic TRIG
+  uint8_t sig2;  // e.g. ultrasonic ECHO
+  uint8_t gnd;   // routed by the backend; this GPIO stays plain INPUT
 };
 
 struct ProbeContext {
   ProbeTopology topology;
   ThreeWirePins powered;  // ThreeWirePowered only
   TwoTerminalPins pair;   // TwoTerminal only
+  FourWirePins fourWire;  // FourWirePowered only
 };
 
 class SensorDriver {

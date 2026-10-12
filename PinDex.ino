@@ -1,7 +1,9 @@
 // PinDex - Smart Component & Sensor Identifier
-// Sensor drivers (src/drivers/) behind a generic probe engine: a
-// DHT11-compatible powered driver and a weak-pull passive/switch driver.
-// Powered and passive probing are controlled separately in config.h
+// Sensor drivers (src/drivers/) behind a generic probe engine on a
+// four-node A/B/C/D socket: a DHT11-compatible three-wire driver, an
+// HC-SR04-compatible four-wire driver (needs a protected backend this
+// board does not have) and a weak-pull passive/switch driver. Powered and
+// passive probing are controlled separately in config.h
 // (PINDEX_POWERED_PROBING_ENABLED, PINDEX_PASSIVE_PROBING_ENABLED); read
 // the README before enabling either.
 
@@ -23,14 +25,20 @@ static void logProbeStatus(const ProbeStatus &s) {
     Serial.printf(" %u/%u", (unsigned)s.scanIndex, (unsigned)s.scanTotal);
   }
   if (s.precheck == PrecheckResult::CouplingObserved) {
-    Serial.printf(" coupled=%s%s%s", (s.coupledPairs & 1) ? "AB " : "",
-                  (s.coupledPairs & 2) ? "BC " : "", (s.coupledPairs & 4) ? "AC" : "");
+    Serial.print(" coupled=");
+    for (uint8_t i = 0; i < PROBE_PAIR_COUNT; i++) {
+      if ((s.coupledPairs & (1u << i)) == 0) continue;
+      const ProbeMapping &p = PROBE_PAIRS[i];
+      Serial.printf("%c%c ", PROBE_NODE_LABEL[probeNodeWithRole(p, NodeRole::Terminal, 0)],
+                    PROBE_NODE_LABEL[probeNodeWithRole(p, NodeRole::Terminal, 1)]);
+    }
   }
   if (s.componentName != nullptr) Serial.printf(" %s", s.componentName);
   if (s.hasMapping) {
-    char mapping[PROBE_MAPPING_TEXT_LEN];
-    formatProbeMapping(s.mapping, mapping, sizeof mapping);
-    Serial.printf(" [%s]", mapping);
+    char first[PROBE_MAPPING_TEXT_LEN];
+    char second[PROBE_MAPPING_TEXT_LEN];
+    formatProbeMapping(s.mapping, s.signalLabel, first, second, sizeof first);
+    Serial.printf(" [%s %s]", first, second);
   }
   if (s.readingValid) {
     Serial.printf(" \"%s\"", s.telemetry1);
@@ -40,6 +48,7 @@ static void logProbeStatus(const ProbeStatus &s) {
   if (s.consecutiveFailures > 0) Serial.printf(" fails=%u", (unsigned)s.consecutiveFailures);
   if (s.lastError != nullptr) Serial.printf(" err=%s", s.lastError);
   if (s.measurementUnavailable) Serial.print(" measurement-unavailable");
+  if (s.hardwareRequired != nullptr) Serial.printf(" hw-required=[%s]", s.hardwareRequired);
   if (s.phase == ProbePhase::Fault) {
     Serial.printf(" precheck=%s; send 'r' to retry", precheckResultName(s.precheck));
   }
@@ -83,6 +92,10 @@ void setup() {
   Serial.println(PINDEX_PASSIVE_PROBING_ENABLED
                      ? "Passive probing ENABLED: weak pull-up + open-drain sink; unpowered parts only."
                      : "Passive probing disabled.");
+  if (probeStatus().hardwareRequired != nullptr) {
+    Serial.printf("%s: hardware required (no protected four-wire backend); not attempted.\n",
+                  probeStatus().hardwareRequired);
+  }
   Serial.println("Serial: r=retry fault, c=clear/rescan, l/d/b=guided LDR calibration.");
 
   displayOk = initDisplay();

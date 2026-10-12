@@ -48,29 +48,51 @@ void drawStatusScreen(const char *line1, const char *line2) {
   oled.display();
 }
 
+// Pixel width of `text` at size 1, as the font will draw it.
+uint16_t textWidth(const char *text) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  oled.setTextSize(1);
+  oled.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  return w;
+}
+
 // Detected-component result from the engine snapshot: driver name, the
 // driver's telemetry lines and the mapping. No sensor-specific text here.
-// All lines are size 1 (21 glyphs max); the mapping is the widest at 126px.
+// All lines are size 1 (21 glyphs, 126 px max). The four-node mapping is
+// measured: on one line if it fits, else (always, at this font) as two
+// halves, e.g. "A:VCC B:TRG" / "C:ECH D:GND". Rows with every line used:
+// name 0-7, rule 9, telemetry 12-19 and 21-28, mapping 32-39 and 41-48,
+// status bar 51-63.
 void drawResultScreen(const ProbeStatus &s) {
-  char line[32];
-  const bool twoLines = s.telemetry2[0] != '\0';
+  char first[PROBE_MAPPING_TEXT_LEN];
+  char second[PROBE_MAPPING_TEXT_LEN];
+  char line[2 * PROBE_MAPPING_TEXT_LEN];
+  formatProbeMapping(s.mapping, s.signalLabel, first, second, sizeof first);
+  snprintf(line, sizeof line, "%s %s", first, second);
+  const bool mappingFits = textWidth(line) <= OLED_WIDTH;
+
   oled.clearDisplay();
-  drawCentered(s.componentName != nullptr ? s.componentName : "", 1, 2);  // rows 2-9
-  oled.drawFastHLine(0, 12, OLED_WIDTH, SSD1306_WHITE);
+  drawCentered(s.componentName != nullptr ? s.componentName : "", 1, 0);
+  oled.drawFastHLine(0, 9, OLED_WIDTH, SSD1306_WHITE);
 
-  if (twoLines) {
-    drawCentered(s.telemetry1, 1, 16);  // rows 16-23
-    drawCentered(s.telemetry2, 1, 26);  // rows 26-33
-  } else {
-    drawCentered(s.telemetry1, 1, 20);  // rows 20-27
+  int16_t y = 12;
+  drawCentered(s.telemetry1, 1, y);
+  if (s.telemetry2[0] != '\0') {
+    y += 9;
+    drawCentered(s.telemetry2, 1, y);
   }
-
-  formatProbeMapping(s.mapping, line, sizeof line);
-  drawCentered(line, 1, twoLines ? 37 : 34);  // rows 37-44 or 34-41
+  y += 11;
+  if (mappingFits) {
+    drawCentered(line, 1, y);
+  } else {
+    drawCentered(first, 1, y);
+    drawCentered(second, 1, y + 9);
+  }
 
   if (s.readingStale) {
     // Inverted bar so old values are never mistaken for live ones.
-    oled.fillRect(0, 48, OLED_WIDTH, 16, SSD1306_WHITE);
+    oled.fillRect(0, 51, OLED_WIDTH, OLED_HEIGHT - 51, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     if (s.consecutiveFailures > 0) {
       snprintf(line, sizeof line, "STALE - fail %u/%u", (unsigned)s.consecutiveFailures,
@@ -78,10 +100,10 @@ void drawResultScreen(const ProbeStatus &s) {
     } else {
       snprintf(line, sizeof line, "STALE");  // reconnected, awaiting a new sample
     }
-    drawCentered(line, 1, 52);  // rows 52-59
+    drawCentered(line, 1, 54);  // rows 54-61
     oled.setTextColor(SSD1306_WHITE);
   } else {
-    drawCentered("LIVE", 1, 52);
+    drawCentered("LIVE", 1, 54);
   }
   oled.display();
 }
