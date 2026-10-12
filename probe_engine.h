@@ -69,8 +69,78 @@ enum class PrecheckResult : uint8_t {
   NotRun,
   NoObviousCoupling,     // no pulled-down node read HIGH; NOT proof of no short
   CouplingObserved,      // some pair coupled (contact or finite R): no powered
-                         // drive across it; passive measurement may proceed
+                         // drive across it (except the measured open-drain
+                         // pull-up exception, decideCoupling()); passive
+                         // measurement may proceed
   InconsistentReadings,  // still noisy after PRECHECK_MAX_RETRIES: unknown
+};
+
+// Derived evidence for one physical pair, from a weak-pull ADC measurement
+// in both orientations with every supply off. Never derived from the
+// digital CouplingObserved flag alone.
+enum class CouplingClassification : uint8_t {
+  Unclassified,      // not measured in this observation cycle
+  PullupCompatible,  // stable, symmetric, inside the supported single pull-up band
+  Resistive,         // stable, symmetric, finite, outside that band (e.g. two pull-ups in series)
+  LowImpedance,      // a contact-band reading in either orientation: cannot be told from a short
+  OpenLike,          // stable, symmetric, at/above the open band: no finite path seen
+  Ambiguous,         // unstable or directional (junctions, regulators, charging capacitance)
+  MeasurementError,  // ADC unavailable/failed, or the pull-up could not be verified
+};
+
+struct PairEvidence {
+  CouplingClassification classification;
+  uint16_t mv[2];  // window mean, sensing the pair's first terminal, then its second
+                   // (real measurements only; 0 when not measured or on error)
+};
+
+enum class CouplingVerdict : uint8_t {
+  Allowed,           // no coupling on a path the attempt drives (the existing rule)
+  PullupException,   // allowed by the narrow open-drain pull-up exception
+  NeedsMeasurement,  // the exception may apply once `measure` is classified
+  Blocked,           // vetoed; `reason` says why
+};
+
+struct CouplingDecision {
+  CouplingVerdict verdict;
+  uint8_t measure;  // NeedsMeasurement: PROBE_PAIRS bits still to classify
+  char reason[48];  // e.g. "VCC-GND coupling", "open-drain pull-up exception"
+};
+
+// Classifies one pair from its two orientation means and window spreads.
+CouplingClassification classifyCouplingPair(const uint16_t mv[2], const uint16_t spreadMv[2]);
+
+// True if the SIG1-SIG2 reading matches the VCC-SIG1 and VCC-SIG2 pull-ups
+// in series (all mean mV), within PULLUP_SERIES_TOLERANCE_PCT.
+bool pullupSeriesExplained(uint16_t vccSig1Mv, uint16_t vccSig2Mv, uint16_t sig1Sig2Mv);
+
+// The precheck coupling policy for a powered (ProtectedActive) candidate
+// whose capabilities and supply are already permitted. Order: VCC-GND
+// coupling is always vetoed; no coupling on a driven path is allowed (the
+// existing rule); otherwise only a FourWirePowered + Supply3V3 +
+// open-drain candidate whose VCC is coupled to SIG1/SIG2 alone may use the
+// pull-up exception, and only after VCC-GND, VCC-SIG1, VCC-SIG2 and
+// SIG1-SIG2 are classified in this observation cycle (`measured`,
+// `pairEvidence`): the rail must measure finite-high or open (pull-ups can
+// mask a rail short from the digital test), both VCC-signal pairs
+// PullupCompatible and SIG1-SIG2 their series path. Physical pairs come
+// from `m`'s roles every time; nothing is cached per role. Passing means
+// only that this policy did not veto the attempt.
+CouplingDecision decideCoupling(const DriverRequirements &r, const ProbeMapping &m, uint8_t coupled,
+                                uint8_t measured, const PairEvidence pairEvidence[]);
+
+// The latest coupling-policy evaluation of a powered candidate that was
+// blocked by coupling or allowed by the exception (diagnostics only).
+struct CouplingEvaluation {
+  uint32_t serial;               // changes with every new evaluation; 0 = none yet
+  ProbeMapping mapping;          // candidate mapping it was evaluated for
+  const char *driverName;
+  const char *signalLabel[2];
+  uint8_t coupledPairs;          // raw digital observation of that precheck pass
+  uint8_t measuredPairs;         // pairs classified in that pass
+  PairEvidence pair[PROBE_PAIR_COUNT];
+  CouplingVerdict verdict;
+  char reason[48];
 };
 
 // Snapshot of engine state and the latest result. Renderers use only this;
@@ -96,6 +166,7 @@ struct ProbeStatus {
   bool measurementUnavailable;   // last cycle failed on measurement errors (e.g. ADC)
   uint8_t hardwareRequiredMask;  // bit i: registered driver i is enabled but has no eligible
                                  // supply (no capable backend, profile off); it is skipped
+  CouplingEvaluation evaluation; // latest coupling evaluation (Serial log; not displayed)
   uint32_t revision;             // changes whenever a displayed field changes
 };
 
@@ -142,5 +213,9 @@ bool probeFormatDiagnostics(char *buf, size_t len);
 void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLabel, char *first,
                         char *second, size_t len);
 
+// "VCC", "DAT", "GND", "T", the signal label (or "S1"/"S2"), "---".
+const char *probeRoleName(NodeRole role, const char *const *signalLabel);
+
 const char *probePhaseName(ProbePhase phase);
 const char *precheckResultName(PrecheckResult result);
+const char *couplingClassificationName(CouplingClassification c);

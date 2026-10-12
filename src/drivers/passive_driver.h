@@ -1,16 +1,11 @@
 // Passive two-terminal driver: resistive parts, contacts and switch-like
 // behaviour, measured with weak internal pull-up excitation only (see
-// passive_adc.h). Classification is conservative and evidence-based; it
+// weak_pull_meter.h). Classification is conservative and evidence-based; it
 // never proves what the part is.
 #pragma once
 
 #include "../../sensor_driver.h"
-
-// Approximate divider estimate R ~ Rpullup * V / (Vsupply - V), treating
-// the open-drain LOW sink as 0 V and the pull-up as its nominal value.
-// False outside [PASSIVE_CONTACT_MAX_MV, PASSIVE_OPEN_MIN_MV], where the
-// reading is a bound (contact-like / open-like), not a value.
-bool passiveEstimateOhms(uint16_t senseMv, uint32_t &ohms);
+#include "weak_pull_meter.h"  // also passiveEstimateOhms()
 
 class PassiveDriver final : public SensorDriver {
  public:
@@ -27,7 +22,6 @@ class PassiveDriver final : public SensorDriver {
 
  private:
   enum class Operation : uint8_t { None, Probe, Sample };
-  enum class Step : uint8_t { Idle, Reference, Divider };
   enum class Advance : uint8_t { Pending, OrientationDone, Failed };
   enum class Kind : uint8_t { Unknown, Contact, Switch, Resistive, Variable, Ldr };
   enum class Guided : uint8_t { Off, AwaitDark, CollectDark, AwaitBright, CollectBright };
@@ -55,18 +49,8 @@ class PassiveDriver final : public SensorDriver {
   bool bound_ = false;  // pair known from a successful probe()
   uint8_t first_ = 0;
   uint8_t second_ = 0;
-  uint8_t sensePin_ = 0;
-  uint8_t sinkPin_ = 0;
-  bool senseActive_ = false;  // ADC + pull-up configured on sensePin_
-  bool sinkActive_ = false;   // open-drain LOW on sinkPin_
+  WeakPullMeter meter_;       // the orientation being measured
   bool reversed_ = false;     // current orientation
-  Step step_ = Step::Idle;
-  uint32_t stepSinceMs_ = 0;
-  uint32_t waitMs_ = 0;
-  uint8_t samples_ = 0;
-  uint32_t sumMv_ = 0;
-  uint16_t minMv_ = 0;
-  uint16_t maxMv_ = 0;
   uint16_t resultMv_[2] = {0, 0};  // window average per orientation
   uint16_t spreadMv_[2] = {0, 0};
 

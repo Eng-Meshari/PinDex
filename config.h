@@ -86,6 +86,29 @@
 #define PRECHECK_SAMPLES 4               // per pull-up source node
 #define PRECHECK_MAX_RETRIES 2           // extra passes after inconsistent readings
 
+// Narrow open-drain pull-up exception (probe_engine.cpp). Only for a
+// FourWirePowered + Supply3V3 + open-drain candidate (the I2C scanner)
+// whose supply profile is already eligible, and only when the precheck saw
+// its VCC node coupled to SIG1/SIG2 and to nothing else. Then VCC-SIG1,
+// VCC-SIG2 and SIG1-SIG2 are each measured with the passive weak-pull
+// meter (internal pull-up + open-drain LOW sink, supply off, both
+// orientations). Bands are sensed mV of the nominal 45 kOhm pull-up
+// divider, derived on paper and NOT validated on hardware:
+//   4.7k-10k (+-5%) against an assumed 30k-67k internal pull-up spread
+//   gives ~206-856 mV; ~+-40 mV ADC uncertainty widens it to 170-900 mV.
+//   At or below PASSIVE_CONTACT_MAX_MV (150 mV, near the ADC's floor at
+//   12 dB) a path cannot be told from a short: low impedance, never allowed.
+//   SIG1-SIG2 must match the two pull-ups in series (common VCC) within
+//   PULLUP_SERIES_TOLERANCE_PCT, using the same approximate estimate as the
+//   passive driver; pin-to-pin pull-up mismatch and ADC error dominate it.
+// Stability and symmetry reuse PASSIVE_STABLE_SPREAD_MV and
+// PASSIVE_SYMMETRY_*. Narrowing these bands only makes the policy stricter.
+#define PULLUP_CLASSIFY_SETTLE_MS 20UL   // after each excitation change (module capacitance)
+#define PULLUP_COMPATIBLE_MIN_MV 170     // sensed mV band of one supported pull-up
+#define PULLUP_COMPATIBLE_MAX_MV 900
+#define PULLUP_SERIES_TOLERANCE_PCT 35   // SIG1-SIG2 vs. the sum of both pull-up estimates
+#define PRECHECK_LOG_INTERVAL_MS 1000UL  // Serial: at most one blocked evaluation per interval
+
 // Engine power policy (driver-independent). Stabilization and acquisition
 // spacing come from each driver's DriverRequirements.
 #define PROBE_POWER_OFF_MS 300UL         // between attempts; NOT proof of discharge

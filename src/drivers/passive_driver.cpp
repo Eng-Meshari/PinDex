@@ -4,21 +4,16 @@
 #include <stdio.h>
 
 #include "../../config.h"
-#include "passive_adc.h"
 
-// Measurement, per orientation of the probed pair (sense, sink):
-//   1. both terminals plain INPUT; the two unused nodes are never touched;
-//   2. sense: ADC channel + internal pull-up (adapter);
-//   3. reference window with the sink still released: the pull-up must lift
-//      the node near the rail, which verifies it is effective while sampled;
-//   4. sink: latch LOW, then OUTPUT_OPEN_DRAIN (cannot drive HIGH, ever);
-//   5. divider window; 6. release sink and sense back to plain INPUT.
+// Measurement, per orientation of the probed pair (sense, sink): one
+// WeakPullMeter run (weak_pull_meter.h: both terminals plain INPUT, ADC +
+// internal pull-up on sense, verified reference window, open-drain LOW
+// sink, divider window, release). The two unused nodes are never touched.
 // A probe runs both orientations and requires symmetric, stable results.
 // Every wait is cooperative (Pending); each call does at most one ADC read.
 
 static_assert(PASSIVE_CONTACT_MAX_MV < PASSIVE_OPEN_MIN_MV, "contact and open bands overlap");
 static_assert(PASSIVE_OPEN_MIN_MV < PASSIVE_SUPPLY_MV, "the divider estimate needs V < Vsupply");
-static_assert(PASSIVE_PULLUP_VERIFY_MIN_MV < PASSIVE_SUPPLY_MV, "pull-up check above the rail");
 static_assert(PASSIVE_LDR_MIN_SEPARATION_MV > 0, "LDR calibration needs a positive span");
 static_assert(PASSIVE_DEBOUNCE_SAMPLES >= 1 && PASSIVE_WINDOW_SAMPLES >= 1 &&
                   PASSIVE_REFERENCE_SAMPLES >= 1 && PASSIVE_LDR_WINDOW_SAMPLES >= 1,
@@ -72,17 +67,6 @@ unsigned signalPercent(uint16_t mv) {
 }
 
 }  // namespace
-
-bool passiveEstimateOhms(uint16_t senseMv, uint32_t &ohms) {
-  if (senseMv < PASSIVE_CONTACT_MAX_MV || senseMv > PASSIVE_OPEN_MIN_MV ||
-      senseMv >= PASSIVE_SUPPLY_MV) {
-    return false;
-  }
-  const uint32_t denominator = PASSIVE_SUPPLY_MV - senseMv;  // > 0 by the checks above
-  ohms = static_cast<uint32_t>(static_cast<uint64_t>(PASSIVE_PULLUP_NOMINAL_OHMS) * senseMv /
-                               denominator);
-  return true;
-}
 
 const char *PassiveDriver::getName() const {
   switch (kind_) {
@@ -157,10 +141,8 @@ void PassiveDriver::reset() {
   failureReason_ = "";
   measurementError_ = false;
   bound_ = false;
-  first_ = second_ = sensePin_ = sinkPin_ = 0;
+  first_ = second_ = 0;
   reversed_ = false;
-  step_ = Step::Idle;
-  samples_ = 0;
   clearClassification();
 }
 
@@ -197,69 +179,24 @@ bool PassiveDriver::handleUserCommand(char command) {
 
 bool PassiveDriver::startOrientation(bool reversed) {
   reversed_ = reversed;
-  sensePin_ = reversed ? second_ : first_;
-  sinkPin_ = reversed ? first_ : second_;
-  pinMode(first_, INPUT);  // both terminals high impedance before excitation
-  pinMode(second_, INPUT);
-  senseActive_ = true;  // so every failure path releases it
-  const PassiveAdcStatus begun = passiveAdcBeginSense(sensePin_);
-  if (begun != PassiveAdcStatus::Ok) {
-    return fail(begun == PassiveAdcStatus::Unavailable ? "adc-unavailable" : "adc-config-failed",
-                true);
-  }
-  step_ = Step::Reference;
-  samples_ = 0;
-  sumMv_ = 0;
-  minMv_ = 0xFFFF;
-  maxMv_ = 0;
-  stepSinceMs_ = millis();
-  waitMs_ = PASSIVE_SETTLE_MS;
-  return true;
+  if (meter_.start(reversed ? second_ : first_, reversed ? first_ : second_, PASSIVE_SETTLE_MS)) return true;
+  return fail(meter_.failureReason(), true);
 }
 
 PassiveDriver::Advance PassiveDriver::advance() {
-  const uint32_t now = millis();
-  if (now - stepSinceMs_ < waitMs_) return Advance::Pending;  // rollover-safe
-  stepSinceMs_ = now;
-  waitMs_ = PASSIVE_SAMPLE_INTERVAL_MS;
-
-  uint16_t mv = 0;
-  if (passiveAdcReadMv(sensePin_, mv) != PassiveAdcStatus::Ok) {
-    fail("adc-read-failed", true);  // never confused with a valid 0 mV
-    return Advance::Failed;
-  }
-
-  if (step_ == Step::Reference) {
-    // Only the pull-up acts on this node now. If it does not sit near the
-    // rail, the pull-up is not effective while sampled (or something
-    // external holds the node), so no divider reading can be trusted.
-    if (mv < PASSIVE_PULLUP_VERIFY_MIN_MV) {
-      fail("pullup-unverified", true);
+  switch (meter_.advance()) {
+    case WeakPullMeter::Result::Pending:
+      return Advance::Pending;
+    case WeakPullMeter::Result::Failed:
+      fail(meter_.failureReason(), true);  // ADC or pull-up problem: never a 0 mV reading
       return Advance::Failed;
-    }
-    if (++samples_ < PASSIVE_REFERENCE_SAMPLES) return Advance::Pending;
-    digitalWrite(sinkPin_, LOW);           // latch LOW first...
-    pinMode(sinkPin_, OUTPUT_OPEN_DRAIN);  // ...open-drain: sinks only, never HIGH
-    sinkActive_ = true;
-    step_ = Step::Divider;
-    samples_ = 0;
-    sumMv_ = 0;
-    minMv_ = 0xFFFF;
-    maxMv_ = 0;
-    waitMs_ = PASSIVE_SETTLE_MS;
-    return Advance::Pending;
+    case WeakPullMeter::Result::Done:
+      break;
   }
-
-  sumMv_ += mv;
-  if (mv < minMv_) minMv_ = mv;
-  if (mv > maxMv_) maxMv_ = mv;
-  if (++samples_ < PASSIVE_WINDOW_SAMPLES) return Advance::Pending;
   const int slot = reversed_ ? 1 : 0;
-  resultMv_[slot] = static_cast<uint16_t>(sumMv_ / samples_);
-  spreadMv_[slot] = static_cast<uint16_t>(maxMv_ - minMv_);
-  releaseExcitation();
-  step_ = Step::Idle;
-  return Advance::OrientationDone;
+  resultMv_[slot] = meter_.meanMv();
+  spreadMv_[slot] = meter_.spreadMv();
+  return Advance::OrientationDone;  // the meter has released the pair
 }
 
 // Both orientations measured: accept only a stable, symmetric, conducting
@@ -443,22 +380,12 @@ bool PassiveDriver::fail(const char *reason, bool measurementError) {
   status_ = DriverOperationStatus::Failed;
   failureReason_ = reason;
   measurementError_ = measurementError;
-  step_ = Step::Idle;
   return false;
 }
 
-// Only ever makes the pair safer: the sink back to plain INPUT, the sense
-// pull-up off and its pad back to a digital INPUT. Untouched pins stay so.
-void PassiveDriver::releaseExcitation() {
-  if (sinkActive_) {
-    pinMode(sinkPin_, INPUT);
-    sinkActive_ = false;
-  }
-  if (senseActive_) {
-    passiveAdcEndSense(sensePin_);
-    senseActive_ = false;
-  }
-}
+// Only ever makes the pair safer (see WeakPullMeter::release()). Untouched
+// pins stay so.
+void PassiveDriver::releaseExcitation() { meter_.release(); }
 
 void PassiveDriver::clearClassification() {
   kind_ = Kind::Unknown;

@@ -4,7 +4,8 @@
 // (POWERED / PASSIVE / I2C_GPIO_POWER):
 //   SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp
 //        src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp
-//        src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp"
+//        src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp
+//        src/drivers/weak_pull_meter.cpp"
 //   g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1
 //       -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=0 $SRC -o build/test_all
 //   1/1/1 -> build/test_i2c_gpio   (the experimental GPIO profile on)
@@ -339,7 +340,10 @@ static int highDriveEvents = 0;  // any probe pin driven HIGH (push-pull)
 static int adcReadsInCritical = 0;
 static int adcWithIsrAttached = 0;  // passive sensing began with a probe interrupt still attached
 static int adcWithI2cRunning = 0;   // passive sensing began with the probe I2C controller running
+static int adcWhilePowered = 0;     // weak-pull sensing began with a supply on (backend or push-pull GPIO)
+static int pushPullWhileSensing = 0;  // a probe GPIO went push-pull while a pad was being sensed
 static bool i2cControllerRunning();  // simulated bus (below)
+static bool probeSupplyOn();         // backend connected or a probe GPIO push-pull (below)
 static bool flakyA = false;  // A alternates HIGH/LOW while pulled up
 static int flakyReads = 0;
 
@@ -501,6 +505,9 @@ struct Network {
   bool adcBeginFails = false;
   bool adcReadFails = false;
   bool pullupIneffective = false;  // pull-up has no effect on an analog pad
+  double pulldownOhms = 45000.0;   // real pull-up/pull-down strengths differ; a weaker
+                                   // pull-down lets the digital precheck flag finite
+                                   // paths such as an I2C breakout's pull-ups
 };
 static Network net;
 static bool noiseFlip = false;
@@ -532,7 +539,7 @@ static void solveNodes(double v[PROBE_NODE_COUNT]) {
     if (output && (p.mode & OPEN_DRAIN) && p.latch == LOW) toRail(1.0 / 25.0, 0.0);
     const bool analog = (p.mode & ANALOG) == ANALOG;
     if ((p.mode & PULLUP) && !(analog && net.pullupIneffective)) toRail(1.0 / 45000.0, 3.3);
-    if (!analog && (p.mode & PULLDOWN)) toRail(1.0 / 45000.0, 0.0);
+    if (!analog && (p.mode & PULLDOWN)) toRail(1.0 / net.pulldownOhms, 0.0);
     for (int j = 0; j < PROBE_NODE_COUNT; j++) {
       if (j == i) continue;
       const double c = 1.0 / net.r[i][j];
@@ -577,6 +584,7 @@ PassiveAdcStatus passiveAdcBeginSense(uint8_t pin) {
   if (senseCount < 128) senseLog[senseCount++] = pin;
   if (anyProbeIsrAttached()) adcWithIsrAttached++;  // an ultrasonic interrupt was not released
   if (i2cControllerRunning()) adcWithI2cRunning++;  // the I2C controller was not stopped
+  if (probeSupplyOn()) adcWhilePowered++;  // classification/passive sensing with power on
   if (net.adcUnavailable) return PassiveAdcStatus::Unavailable;
   if (net.adcBeginFails) return PassiveAdcStatus::ConfigFailed;
   mock::pins[pin].mode = ANALOG | PULLUP;  // analog pad, pull-up re-enabled after setup
@@ -700,6 +708,14 @@ static void sonarPowerLost();
 static void supplyRemoved();
 
 uint16_t fourWireBackendCapabilities() { return backend.caps; }
+
+static bool probeSupplyOn() {
+  if (backend.connected) return true;
+  for (uint8_t g : PROBE_NODE_GPIO) {
+    if (mock::isOutput(g) && !(mock::pins[g].mode & OPEN_DRAIN)) return true;
+  }
+  return false;
+}
 
 bool fourWireBackendConnect(uint16_t supply, uint8_t vcc, uint8_t sig1, uint8_t sig2, uint8_t gnd) {
   backend.requests++;
@@ -970,6 +986,11 @@ bool i2cBusEnd() {
 static void onPinChange(uint8_t pin, bool isPinMode) {
   if (isPinMode && mock::criticalDepth != 0) lockedPinModes++;
   if (nodeOf(pin) >= 0 && mock::drivesHigh(pin)) highDriveEvents++;
+  if (nodeOf(pin) >= 0 && mock::isOutput(pin) && !(mock::pins[pin].mode & OPEN_DRAIN)) {
+    for (uint8_t g : PROBE_NODE_GPIO) {
+      if ((mock::pins[g].mode & ANALOG) == ANALOG) pushPullWhileSensing++;
+    }
+  }
   if (pin < 64) {
     if (wasDrivingHigh[pin] && !mock::drivesHigh(pin)) supplyRemoved();
     wasDrivingHigh[pin] = mock::drivesHigh(pin);
@@ -2195,6 +2216,183 @@ static void testI2cHandoff() {
   CHECK(i2cSim.begins == 1);  // nothing restarted the I2C controller
 }
 
+// ---- Coupling policy: classification and decisions (every build) -----------
+
+// Sensed mV of the nominal 45 kOhm pull-up against `ohms` to a 0 V sink.
+static uint16_t dividerMv(double ohms) { return static_cast<uint16_t>(lround(3300.0 * ohms / (ohms + 45000.0))); }
+
+static CouplingClassification classify(uint16_t mv0, uint16_t mv1, uint16_t spread = 4) {
+  const uint16_t mv[2] = {mv0, mv1};
+  const uint16_t spreads[2] = {spread, spread};
+  return classifyCouplingPair(mv, spreads);
+}
+
+static uint8_t bitOf(int x, int y) { return probePairBit(static_cast<uint8_t>(x), static_cast<uint8_t>(y)); }
+
+static int pairIdx(int x, int y) {
+  for (int i = 0; i < PROBE_PAIR_COUNT; i++) {
+    if (bitOf(x, y) == (1u << i)) return i;
+  }
+  return -1;
+}
+
+// Evidence for pair x-y as the meter would report it (orientation means).
+static void setEvidence(PairEvidence ev[], int x, int y, uint16_t mv0, uint16_t mv1 = 0xFFFF,
+                        uint16_t spread = 4) {
+  const uint16_t mv[2] = {mv0, mv1 == 0xFFFF ? mv0 : mv1};
+  const uint16_t spreads[2] = {spread, spread};
+  ev[pairIdx(x, y)] = PairEvidence{classifyCouplingPair(mv, spreads), {mv[0], mv[1]}};
+}
+
+static void testCouplingClassifier() {
+  using C = CouplingClassification;
+  // Supported 4.7k and 10k pull-ups, also against an internal pull-up of
+  // 67k (4.47k: 206 mV) or 30k (10.5k: 856 mV) instead of the nominal 45k,
+  // and with some pin-to-pin mismatch between the two orientations.
+  CHECK(classify(dividerMv(4700), dividerMv(4700)) == C::PullupCompatible);
+  CHECK(classify(dividerMv(10000), dividerMv(10000)) == C::PullupCompatible);
+  CHECK(classify(206, 206) == C::PullupCompatible && classify(856, 856) == C::PullupCompatible);
+  CHECK(classify(290, 340) == C::PullupCompatible);
+  // Near zero in either direction: low impedance, never a pull-up.
+  CHECK(classify(dividerMv(1.0), dividerMv(1.0)) == C::LowImpedance);
+  CHECK(classify(PASSIVE_CONTACT_MAX_MV, 313) == C::LowImpedance && classify(313, 20) == C::LowImpedance);
+  // Unstable, directional, open-like or outside the band: never compatible.
+  CHECK(classify(313, 313, PASSIVE_STABLE_SPREAD_MV + 1) == C::Ambiguous);
+  CHECK(classify(1200, 313) == C::Ambiguous);
+  CHECK(classify(3100, 3100) == C::OpenLike);
+  CHECK(classify(dividerMv(2200), dividerMv(2200)) == C::Resistive);    // 154 mV: unsupported 2.2k
+  CHECK(classify(dividerMv(20000), dividerMv(20000)) == C::Resistive);  // two 10k in series
+  CHECK(classify(PULLUP_COMPATIBLE_MIN_MV - 1, PULLUP_COMPATIBLE_MIN_MV - 1) == C::Resistive);
+  CHECK(classify(PULLUP_COMPATIBLE_MAX_MV + 1, PULLUP_COMPATIBLE_MAX_MV + 1) == C::Resistive);
+
+  // SIG1-SIG2 through two pull-ups to one VCC is their series sum.
+  CHECK(pullupSeriesExplained(dividerMv(4700), dividerMv(4700), dividerMv(9400)));
+  CHECK(pullupSeriesExplained(dividerMv(10000), dividerMv(10000), dividerMv(20000)));
+  CHECK(pullupSeriesExplained(dividerMv(4700), dividerMv(10000), dividerMv(14700)));
+  CHECK(!pullupSeriesExplained(dividerMv(4700), dividerMv(4700), dividerMv(4700)));  // another path
+  CHECK(!pullupSeriesExplained(dividerMv(4700), dividerMv(4700), dividerMv(1.0)));   // a short: a bound
+  CHECK(!pullupSeriesExplained(dividerMv(4700), dividerMv(4700), 3100));             // open
+  CHECK(!pullupSeriesExplained(0, dividerMv(4700), dividerMv(9400)));
+}
+
+static void testCouplingPolicy() {
+  using C = CouplingClassification;
+  using V = CouplingVerdict;
+  const DriverRequirements &r = i2c.getRequirements();  // FourWire + Supply3V3 + open-drain
+
+  // A breakout with VCC on A, GND on B and 4.7k pull-ups to C and D, every
+  // pair measured; the digital precheck flagged A-C and A-D. Each of the 24
+  // mappings evaluates its own physical pairs: only VCC A / GND B (SDA/SCL
+  // either way round) earns the exception; VCC on B sees no coupling (the
+  // existing rule); everything else is vetoed.
+  PairEvidence ev[PROBE_PAIR_COUNT];
+  for (int i = 0; i < PROBE_PAIR_COUNT; i++) {
+    setEvidence(ev, probeNodeWithRole(PROBE_PAIRS[i], NodeRole::Terminal, 0),
+                probeNodeWithRole(PROBE_PAIRS[i], NodeRole::Terminal, 1), 3100);
+  }
+  setEvidence(ev, 0, 2, dividerMv(4700));
+  setEvidence(ev, 0, 3, dividerMv(4700));
+  setEvidence(ev, 2, 3, dividerMv(9400));
+  const uint8_t coupled = static_cast<uint8_t>(bitOf(0, 2) | bitOf(0, 3));
+  const uint8_t all = (1u << PROBE_PAIR_COUNT) - 1;
+  int exceptions = 0;
+  int allowed = 0;
+  for (int i = 0; i < PROBE_FOUR_WIRE_COUNT; i++) {
+    const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[i];
+    const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
+    const int s1 = probeNodeWithRole(m, NodeRole::Sig1);
+    const int s2 = probeNodeWithRole(m, NodeRole::Sig2);
+    const int gnd = probeNodeWithRole(m, NodeRole::Gnd);
+    const CouplingDecision first = decideCoupling(r, m, coupled, 0, ev);  // nothing classified yet
+    const CouplingDecision d = decideCoupling(r, m, coupled, all, ev);
+    if (vcc == 1) {
+      CHECK(first.verdict == V::Allowed && d.verdict == V::Allowed);
+      allowed++;
+    } else if ((coupled & bitOf(vcc, gnd)) != 0) {
+      CHECK(first.verdict == V::Blocked && same(first.reason, "VCC-GND coupling") && first.measure == 0);
+      CHECK(d.verdict == V::Blocked && same(d.reason, "VCC-GND coupling"));
+    } else if ((coupled & (bitOf(s1, gnd) | bitOf(s2, gnd))) != 0) {
+      CHECK(first.verdict == V::Blocked && same(first.reason, "signal-GND coupling unexplained"));
+    } else {
+      // Digital coupling alone never grants: the pairs are requested first.
+      CHECK(first.verdict == V::NeedsMeasurement);
+      CHECK(first.measure == (bitOf(vcc, gnd) | bitOf(vcc, s1) | bitOf(vcc, s2) | bitOf(s1, s2)));
+      if (i == 3 || i == 5) {
+        CHECK(d.verdict == V::PullupException && same(d.reason, "open-drain pull-up exception"));
+        exceptions++;
+      } else {
+        CHECK(d.verdict == V::Blocked);  // the common node is not this mapping's VCC
+      }
+    }
+  }
+  CHECK(exceptions == 2 && allowed == 6);
+
+  // Mapping 4 (A VCC, C SDA, D SCL, B GND): one fault at a time.
+  const ProbeMapping &m = PROBE_FOUR_WIRE_MAPPINGS[3];
+  struct Case {
+    void (*fault)(PairEvidence *);
+    const char *reason;
+  };
+  const Case cases[] = {
+      {[](PairEvidence *e) { setEvidence(e, 0, 1, 0); }, "VCC-GND low impedance"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 1, 3100, 600); }, "VCC-GND evidence ambiguous"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 1, 3100, 3100, 200); }, "VCC-GND evidence ambiguous"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 2, 2); }, "VCC-SDA low impedance"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 3, 2); }, "VCC-SCL low impedance"},
+      {[](PairEvidence *e) { setEvidence(e, 2, 3, 2); }, "SDA-SCL low impedance"},
+      {[](PairEvidence *e) { e[pairIdx(0, 2)] = PairEvidence{C::MeasurementError, {0, 0}}; },
+       "ADC measurement unavailable"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 2, 313, 1200); }, "pull-up classification ambiguous (VCC-SDA)"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 3, 313, 313, 120); },
+       "pull-up classification ambiguous (VCC-SCL)"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 2, 3100); }, "pull-up classification ambiguous (VCC-SDA)"},
+      {[](PairEvidence *e) { setEvidence(e, 0, 2, dividerMv(20000)); }, "VCC-SDA outside pull-up range"},
+      {[](PairEvidence *e) { setEvidence(e, 2, 3, dividerMv(4700)); }, "SDA-SCL path not explained by pull-ups"},
+      {[](PairEvidence *e) { setEvidence(e, 2, 3, 3100); }, "SDA-SCL path not explained by pull-ups"},
+      {[](PairEvidence *e) { memset(e, 0, sizeof(PairEvidence) * PROBE_PAIR_COUNT); },
+       "VCC-GND evidence ambiguous"},  // "measured" but nothing classified: never a pass
+  };
+  for (const Case &c : cases) {
+    PairEvidence bad[PROBE_PAIR_COUNT];
+    memcpy(bad, ev, sizeof bad);
+    c.fault(bad);
+    const CouplingDecision d = decideCoupling(r, m, coupled, all, bad);
+    CHECK(d.verdict == V::Blocked && same(d.reason, c.reason));
+  }
+  // A finite (not near-zero) rail path, or 10k pull-ups, still qualify.
+  PairEvidence ok[PROBE_PAIR_COUNT];
+  memcpy(ok, ev, sizeof ok);
+  setEvidence(ok, 0, 1, dividerMv(47000));
+  CHECK(decideCoupling(r, m, coupled, all, ok).verdict == V::PullupException);
+  setEvidence(ok, 0, 2, dividerMv(10000));
+  setEvidence(ok, 0, 3, dividerMv(10000));
+  setEvidence(ok, 2, 3, dividerMv(20000));
+  CHECK(decideCoupling(r, m, coupled, all, ok).verdict == V::PullupException);
+
+  // Digital VCC-GND coupling is never relaxed, whatever the evidence says.
+  CHECK(same(decideCoupling(r, m, static_cast<uint8_t>(coupled | bitOf(0, 1)), all, ev).reason, "VCC-GND coupling"));
+
+  // Only the capability combination, never a driver: the same evidence
+  // with a 5 V supply or push-pull signals keeps the existing veto.
+  DriverRequirements other = r;
+  other.supply = SupplyProfile::Backend5V;
+  CHECK(decideCoupling(other, m, coupled, all, ev).verdict == V::Blocked);
+  CHECK(same(decideCoupling(other, m, coupled, all, ev).reason, "VCC coupling"));
+  other = r;
+  other.openDrainSignals = false;
+  CHECK(decideCoupling(other, m, coupled, all, ev).verdict == V::Blocked);
+  CHECK(decideCoupling(ultrasonic.getRequirements(), m, coupled, all, ev).verdict == V::Blocked);
+  CHECK(same(decideCoupling(ultrasonic.getRequirements(), m, bitOf(2, 3), all, ev).reason,
+             "push-pull signal coupling"));
+  CHECK(decideCoupling(r, m, bitOf(2, 3), 0, ev).verdict == V::Allowed);  // open-drain: unchanged
+  CHECK(decideCoupling(r, m, 0, 0, ev).verdict == V::Allowed);
+  // DHT11 (three-wire, GPIO logic, open-drain DATA): any VCC coupling vetoes.
+  const DriverRequirements &dhtReq = dht.getRequirements();
+  CHECK(same(decideCoupling(dhtReq, PROBE_PERMUTATIONS[0], bitOf(0, 1), all, ev).reason, "VCC coupling"));
+  CHECK(same(decideCoupling(dhtReq, PROBE_PERMUTATIONS[0], bitOf(0, 2), all, ev).reason, "VCC-GND coupling"));
+  CHECK(decideCoupling(dhtReq, PROBE_PERMUTATIONS[0], bitOf(1, 3), all, ev).verdict == V::Allowed);
+}
+
 #if PINDEX_POWERED_PROBING_ENABLED
 
 // ---- DHT11 through the engine (Phase 2 behaviour, preserved) ---------------
@@ -2871,6 +3069,187 @@ static void testI2cReleaseFailure() {
   CHECK(phase() == ProbePhase::Scanning && !i2cSim.endFails);
 }
 
+// ---- The open-drain pull-up exception through the engine ---------------------
+
+// The I2C module on mapping 4 (A VCC, C SDA, D SCL, B GND) with pull-ups of
+// `ohms` from VCC to SDA and SCL, behind a protected 3.3 V backend. Weaker
+// simulated pull-downs (100 kOhm) make the digital precheck flag the
+// network as reported on hardware; with equal 45 kOhm pulls it reads LOW.
+static void pullupWorld(double ohms, std::initializer_list<uint8_t> acks = {0x3C}) {
+  useDrivers(&i2c);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  net.pulldownOhms = 100000.0;
+  if (ohms > 0) {
+    connect(0, 2, ohms);
+    connect(0, 3, ohms);
+  }
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, acks);
+}
+
+static bool anyProbeSensed() {
+  for (uint8_t g : PROBE_NODE_GPIO) {
+    if ((mock::pins[g].mode & ANALOG) == ANALOG) return true;
+  }
+  return false;
+}
+
+static void testI2cPullupException() {
+  for (double ohms : {4700.0, 10000.0}) {
+    pullupWorld(ohms);
+    CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 20000));
+    CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+    CHECK(probeStatus().precheck == PrecheckResult::CouplingObserved);
+    CHECK((probeStatus().coupledPairs & (bitOf(0, 2) | bitOf(0, 3))) == (bitOf(0, 2) | bitOf(0, 3)));
+    CHECK((probeStatus().coupledPairs & bitOf(0, 1)) == 0);
+    // The existing snapshot: address, tentative hint and the roles.
+    CHECK(same(probeStatus().componentName, "I2C Device"));
+    CHECK(same(probeStatus().telemetry1, "Addr: 0x3C (ACK)") && same(probeStatus().telemetry2, "SSD1306 / OLED?"));
+    char first[PROBE_MAPPING_TEXT_LEN];
+    char second[PROBE_MAPPING_TEXT_LEN];
+    formatProbeMapping(probeStatus().mapping, probeStatus().signalLabel, first, second, sizeof first);
+    CHECK(same(first, "A:VCC B:GND") && same(second, "C:SDA D:SCL"));
+    // The evidence behind it: measured, not just the digital flags.
+    const CouplingEvaluation &e = probeStatus().evaluation;
+    CHECK(e.verdict == CouplingVerdict::PullupException && same(e.reason, "open-drain pull-up exception"));
+    CHECK(sameRoles(e.mapping, PROBE_FOUR_WIRE_MAPPINGS[3]) && same(e.driverName, "I2C Device"));
+    CHECK(e.measuredPairs == (bitOf(0, 1) | bitOf(0, 2) | bitOf(0, 3) | bitOf(2, 3)));
+    CHECK(e.pair[pairIdx(0, 1)].classification == CouplingClassification::OpenLike);
+    for (int p : {pairIdx(0, 2), pairIdx(0, 3)}) {
+      CHECK(e.pair[p].classification == CouplingClassification::PullupCompatible);
+      for (uint16_t mv : e.pair[p].mv) CHECK(abs(mv - dividerMv(ohms)) <= 3);
+    }
+    for (uint16_t mv : e.pair[pairIdx(2, 3)].mv) CHECK(abs(mv - dividerMv(2 * ohms)) <= 3);
+    // Mappings 1-3 put GND on a coupled pull-up: vetoed unpowered. Mapping 4
+    // was classified (4 pairs x 2 orientations) and was the first one powered.
+    CHECK(e.serial == 4 && senseCount == 8);
+    CHECK(backend.connects == 1 && i2cSim.begins == 1 && backend.violations == 0 && i2cSim.violations == 0);
+    CHECK(highDriveEvents == 0);  // nothing ever driven HIGH from a GPIO (backend supply)
+  }
+
+  // Evidence is never reused: losing the module forces a retry whose fresh
+  // precheck classifies again before the mapping is powered again.
+  pullupWorld(4700.0);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 20000));
+  i2cSim.attached = false;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, I2C_SAMPLE_INTERVAL_MS + 100));
+  const int senses = senseCount;
+  const int connects = backend.connects;
+  CHECK(runUntil([connects] { return backend.connects > connects; }, 3000));
+  CHECK(senseCount == senses + 8);
+  // A short between VCC and SDA appears: the next retry's own classification
+  // finds it, and the saved mapping is never powered again.
+  connect(0, 2, 1.0);
+  const int connectsBefore = backend.connects;
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 15000));
+  CHECK(same(probeStatus().lastError, "blocked-by-precheck"));
+  CHECK(same(probeStatus().evaluation.reason, "VCC-SDA low impedance"));
+  CHECK(backend.connects == connectsBefore && !probeStatus().hasMapping);
+  CHECK(!i2cSim.running && !backend.connected && allProbesPlainInput());
+  CHECK(i2cSim.powerOffWhileRunning == 0);
+}
+
+// Runs until four-wire mapping `index` has been evaluated; its reason.
+static const char *reasonForMapping(int index) {
+  static char reason[48];
+  reason[0] = '\0';
+  runUntil([index] {
+    return probeStatus().evaluation.serial != 0 &&
+           sameRoles(probeStatus().evaluation.mapping, PROBE_FOUR_WIRE_MAPPINGS[index]);
+  }, 20000);
+  snprintf(reason, sizeof reason, "%s", probeStatus().evaluation.reason);
+  return reason;
+}
+
+// Networks that must not receive the exception on the module's own mapping.
+static void testPullupNetworkRejections() {
+  struct Case {
+    void (*setup)();
+    const char *reason;
+  };
+  const Case cases[] = {
+      {[] { connect(0, 2, 1.0); connect(0, 3, 4700); }, "VCC-SDA low impedance"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 1.0); }, "VCC-SCL low impedance"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); connect(2, 3, 1.0); }, "SDA-SCL low impedance"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); connect(2, 3, 4700); },
+       "SDA-SCL path not explained by pull-ups"},
+      // A directional near-short from GND to VCC: the rail is measured even
+      // though the digital precheck saw no VCC-GND coupling.
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); net.asymSenseNode = 1; net.asymMv = 50; },
+       "VCC-GND low impedance"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); net.adcReadFails = true; }, "ADC measurement unavailable"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); net.adcUnavailable = true; },
+       "ADC measurement unavailable"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); net.asymSenseNode = 2; net.asymMv = 1200; },
+       "pull-up classification ambiguous (VCC-SDA)"},
+      {[] { connect(0, 2, 4700); connect(0, 3, 4700); net.noiseMv = 60; },
+       "pull-up classification ambiguous (VCC-SDA)"},
+  };
+  for (const Case &c : cases) {
+    pullupWorld(0);
+    c.setup();
+    CHECK(same(reasonForMapping(3), c.reason));
+    CHECK(probeStatus().evaluation.verdict == CouplingVerdict::Blocked);
+    CHECK((probeStatus().coupledPairs & bitOf(0, 1)) == 0);
+    CHECK((backend.vccNodesUsed & 0x1) == 0 && i2cSim.begins == 0);  // VCC A never powered
+    runMs(5);
+    CHECK(!anyProbeSensed() && !sinkEngaged());  // pins restored after the measurement
+  }
+
+  // An ADC failure is reported as measurement-unavailable for the cycle.
+  pullupWorld(4700.0, {});
+  net.adcReadFails = true;
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
+  CHECK(probeStatus().measurementUnavailable && allProbesPlainInput());
+  CHECK((backend.vccNodesUsed & 0x1) == 0);
+}
+
+// Capabilities decide, never a name: a four-wire 5 V push-pull driver keeps
+// the existing veto with no classification at all; a fake driver declaring
+// the I2C capability combination is classified and gets the exception.
+static void testPullupExceptionCapabilities() {
+  FakeDriver f(1, "Fake F", ProbeTopology::FourWirePowered, ExcitationPolicy::ProtectedActive);
+  useDrivers(&f);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  net.pulldownOhms = 100000.0;
+  connect(0, 2, 4700);
+  connect(0, 3, 4700);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 20000));
+  CHECK(senseCount == 0 && f.calls == 0 && backend.requests == 0);
+  CHECK(same(probeStatus().evaluation.reason, "VCC coupling") ||
+        same(probeStatus().evaluation.reason, "push-pull signal coupling") ||
+        same(probeStatus().evaluation.reason, "VCC-GND coupling"));
+
+  FakeDriver g(2, "Fake G", ProbeTopology::FourWirePowered, ExcitationPolicy::ProtectedActive);
+  g.req.supply = SupplyProfile::Supply3V3;
+  g.req.openDrainSignals = true;
+  g.acceptSlot = 3;
+  useDrivers(&g);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  net.pulldownOhms = 100000.0;
+  connect(0, 2, 4700);
+  connect(0, 3, 4700);
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 20000));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+  CHECK(probeStatus().evaluation.verdict == CouplingVerdict::PullupException);
+  CHECK(g.probeStarts == 1 && g.unpoweredStarts == 0 && senseCount == 8);
+}
+
+// Cancelling during a classification restores every node at once, and the
+// rescan classifies afresh.
+static void testClassificationCancel() {
+  pullupWorld(4700.0, {});
+  CHECK(runUntil([] { return anyProbeSensed(); }, 5000));
+  CHECK(probeRequestClear());  // the rescan's precheck pulls follow at once
+  CHECK(!anyProbeSensed() && !sinkEngaged() && !backend.connected);
+  for (uint8_t g : PROBE_NODE_GPIO) CHECK(!mock::isOutput(g));
+  const int senses = senseCount;
+  CHECK(runUntil([] { return anyProbeSensed(); }, 5000));
+  CHECK(senseCount > senses);
+  CHECK(runUntil([] { return backend.connected; }, 5000));  // then the normal sequence
+  CHECK(!anyProbeSensed() && sameRoles(probeStatus().evaluation.mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+}
+
 #if PINDEX_I2C_GPIO_POWER_ENABLED
 
 // The experimental GPIO profile (this build only). Without a protected
@@ -2902,7 +3281,9 @@ static void testI2cGpioProfile() {
   CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 20000));
   log = collectSessions();
   CHECK(log.violations == 0 && poweredSessions(log) == 12);
-  for (int i = 0; i < log.count; i++) CHECK(log.s[i].vcc == 2 || log.s[i].vcc == 3);
+  // vcc < 0: the unpowered weak-pull classification of VCC-SDA/SCL mappings
+  // (it finds A-B low impedance; nothing on A or B is ever powered).
+  for (int i = 0; i < log.count; i++) CHECK(log.s[i].vcc < 0 || log.s[i].vcc == 2 || log.s[i].vcc == 3);
 
   // A protected 3.3 V backend takes precedence: no GPIO supply at all.
   useDrivers(&i2c);
@@ -2911,6 +3292,23 @@ static void testI2cGpioProfile() {
   setAcks(i2cSim.acks, {0x76});
   CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 10000));
   CHECK(highDriveEvents == 0 && backend.connects == 4 && collectSessions().count == 0);
+
+  // The pull-up exception on this profile: the network is classified with
+  // every GPIO released (no supply, nothing HIGH), then the module's own
+  // mapping is the first one powered, GND LOW then VCC HIGH as usual.
+  useDrivers(&i2c);
+  resetWorld();
+  net.pulldownOhms = 100000.0;
+  connect(0, 2, 4700);
+  connect(0, 3, 4700);
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, {0x3C});
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 20000));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+  CHECK(probeStatus().evaluation.verdict == CouplingVerdict::PullupException);
+  CHECK(mock::drivesHigh(gpioOf(0)) && mock::drivesLow(gpioOf(1)) && highDriveEvents == 1);
+  CHECK(senseCount == 8 && collectSessions().violations == 0);
+  CHECK(same(probeStatus().telemetry1, "Addr: 0x3C (ACK)") && same(probeStatus().telemetry2, "SSD1306 / OLED?"));
 }
 
 #else
@@ -2924,9 +3322,13 @@ static void testI2cNoGpioPower() {
     resetWorld(1000000ULL, caps);
     i2cSim.attached = true;
     setAcks(i2cSim.acks, {0x68});
+    net.pulldownOhms = 100000.0;  // a flagged pull-up network grants nothing either
+    connect(0, 2, 4700);
+    connect(0, 3, 4700);
     runMs(10000);
     CHECK(needsHardware(&i2c) && phase() == ProbePhase::NoComponent);
     CHECK(i2cSim.begins == 0 && backend.requests == 0 && highDriveEvents == 0);
+    CHECK(senseCount == 0 && probeStatus().evaluation.serial == 0);  // never even classified
     CHECK(collectSessions().count == 0);
   }
 }
@@ -3104,6 +3506,37 @@ static void testFourWirePriority() {
   }
   CHECK(t.probeStarts == PROBE_PAIR_COUNT && attempts[0].topology == ProbeTopology::TwoTerminal);
   CHECK(i2cSim.powerOffWhileRunning == 0 && !anyProbeIsrAttached() && allProbesPlainInput());
+}
+
+// A breakout found through the pull-up exception (the production priority
+// order, DHT11 first), then swapped for a DHT11, then for a resistor: the
+// Wire1 controller is stopped before power-off and the later drivers work.
+static void testPullupExceptionThenDhtAndPassive() {
+  useDrivers(&dht, &i2c, &passive);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  net.pulldownOhms = 100000.0;
+  connect(0, 2, 4700);
+  connect(0, 3, 4700);
+  i2cSim.attached = true;
+  setAcks(i2cSim.acks, {0x3C});
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 60000));
+  CHECK(same(probeStatus().componentName, "I2C Device"));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[3]));
+  CHECK(senseCount == 8);  // only the exception's classification; no passive scan
+
+  i2cSim.attached = false;  // the breakout (and its pull-ups) out, a DHT11 in
+  netReset();
+  sensor.attached = true;
+  sensor.wiring = PROBE_PERMUTATIONS[0];
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected && same(probeStatus().componentName, "DHT11 Temp & Hum"); },
+                 60000));
+  CHECK(!i2cSim.running && i2cSim.powerOffWhileRunning == 0);
+
+  sensor.attached = false;  // then a resistor
+  connect(2, 3, 10000);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected && same(probeStatus().componentName, "Resistive Component"); },
+                 150000));
+  CHECK(!i2cSim.running && i2cSim.powerOffWhileRunning == 0 && adcWithI2cRunning == 0);
 }
 
 // The shipped situation: no protected four-wire backend. The ultrasonic
@@ -3465,6 +3898,8 @@ int main() {
   testPassiveToDhtHandoff();
   testUltrasonicHandoff();
   testI2cHandoff();
+  testCouplingClassifier();
+  testCouplingPolicy();
 #if PINDEX_POWERED_PROBING_ENABLED
   testEmptySocketScan();
   testDetectionNeedsTwoFrames();
@@ -3486,6 +3921,10 @@ int main() {
   testI2cDetection();
   testI2cClearMidSweep();
   testI2cReleaseFailure();
+  testI2cPullupException();
+  testPullupNetworkRejections();
+  testPullupExceptionCapabilities();
+  testClassificationCancel();
 #if PINDEX_I2C_GPIO_POWER_ENABLED
   testI2cGpioProfile();
 #else
@@ -3501,6 +3940,7 @@ int main() {
   testI2cSupplyProfiles();
   testI2cPrecheckVeto();
   testFourWirePriority();
+  testPullupExceptionThenDhtAndPassive();
 #endif
 #if PINDEX_PASSIVE_PROBING_ENABLED
   testPassiveResistor();
@@ -3522,6 +3962,8 @@ int main() {
   CHECK(adcReadsInCritical == 0);  // no ADC work inside the DHT critical section
   CHECK(adcWithIsrAttached == 0);  // ultrasonic interrupts released before any ADC use
   CHECK(adcWithI2cRunning == 0);   // the I2C controller stopped before any ADC use
+  CHECK(adcWhilePowered == 0);     // weak-pull sensing (passive or classification) only with every supply off
+  CHECK(pushPullWhileSensing == 0);  // and nothing went push-pull while a pad was sensed
   printf("build powered=%d passive=%d i2c-gpio=%d: %d checks, %d failed\n", PINDEX_POWERED_PROBING_ENABLED,
          PINDEX_PASSIVE_PROBING_ENABLED, PINDEX_I2C_GPIO_POWER_ENABLED, checks, failures);
   return failures == 0 ? 0 : 1;

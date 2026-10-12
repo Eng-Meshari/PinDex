@@ -20,6 +20,9 @@ static unsigned long lastHeartbeatMs = 0;
 static uint32_t shownRevision = 0;
 static uint32_t loggedRevision = 0;
 static bool loggedDetected = false;
+static uint32_t loggedEvaluation = 0;
+static unsigned long lastBlockedLogMs = 0;
+static bool blockedLogged = false;
 
 // The detected driver's cached diagnostics (e.g. every I2C address found);
 // prints nothing if there are none. Never triggers bus or pin activity.
@@ -66,6 +69,42 @@ static void logProbeStatus(const ProbeStatus &s) {
   Serial.println();
   if (s.detected && !loggedDetected) printDiagnostics();  // once per detection
   loggedDetected = s.detected;
+}
+
+// Coupling-policy evidence for a powered candidate the precheck saw coupled:
+// its mapping, each relevant pair (raw digital observation, then the
+// weak-pull ADC classification and its two orientation readings when one
+// was measured) and the outcome. A blocked evaluation is printed at most
+// once per PRECHECK_LOG_INTERVAL_MS; one allowed by the exception always.
+static void logEvaluation(const CouplingEvaluation &e, unsigned long now) {
+  const bool allowed = e.verdict == CouplingVerdict::PullupException;
+  if (!allowed && blockedLogged && now - lastBlockedLogMs < PRECHECK_LOG_INTERVAL_MS) return;
+  if (!allowed) {
+    lastBlockedLogMs = now;
+    blockedLogged = true;
+  }
+  char first[PROBE_MAPPING_TEXT_LEN];
+  char second[PROBE_MAPPING_TEXT_LEN];
+  formatProbeMapping(e.mapping, e.signalLabel, first, second, sizeof first);
+  Serial.printf("precheck: %s %s (%s)\n", first, second, e.driverName);
+  for (uint8_t i = 0; i < PROBE_PAIR_COUNT; i++) {
+    const uint8_t bit = static_cast<uint8_t>(1u << i);
+    if (((e.coupledPairs | e.measuredPairs) & bit) == 0) continue;
+    const int x = probeNodeWithRole(PROBE_PAIRS[i], NodeRole::Terminal, 0);
+    const int y = probeNodeWithRole(PROBE_PAIRS[i], NodeRole::Terminal, 1);
+    Serial.printf("precheck: %c-%c %s-%s %s", PROBE_NODE_LABEL[x], PROBE_NODE_LABEL[y],
+                  probeRoleName(e.mapping.role[x], e.signalLabel), probeRoleName(e.mapping.role[y], e.signalLabel),
+                  (e.coupledPairs & bit) ? "coupled" : "not-coupled");
+    if (e.measuredPairs & bit) {
+      const PairEvidence &p = e.pair[i];
+      Serial.printf(" -> %s", couplingClassificationName(p.classification));
+      if (p.classification != CouplingClassification::MeasurementError) {
+        Serial.printf(" %u/%u mV", (unsigned)p.mv[0], (unsigned)p.mv[1]);
+      }
+    }
+    Serial.println();
+  }
+  Serial.printf("candidate: %s; %s\n", allowed ? "allowed" : "blocked", e.reason);
 }
 
 // Non-blocking: handles only bytes that have already arrived.
@@ -136,15 +175,19 @@ void loop() {
   probeTick();
   handleSerialCommands();
 
+  // Unsigned subtraction keeps every comparison correct across the
+  // ~49.7-day millis() rollover.
+  const unsigned long now = millis();
+
   const ProbeStatus &probe = probeStatus();
+  if (probe.evaluation.serial != loggedEvaluation) {
+    loggedEvaluation = probe.evaluation.serial;
+    logEvaluation(probe.evaluation, now);
+  }
   if (probe.revision != loggedRevision) {
     loggedRevision = probe.revision;
     logProbeStatus(probe);
   }
-
-  // Unsigned subtraction keeps every comparison correct across the
-  // ~49.7-day millis() rollover.
-  const unsigned long now = millis();
 
   // The splash is drawn once in setup(). When it expires the screen follows
   // the probe status, so the splash can never overwrite a result or fault.

@@ -1,6 +1,7 @@
 #include "probe_engine.h"
 
 #include <Arduino.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -8,6 +9,7 @@
 #include "four_wire_backend.h"
 #include "sensor_driver.h"
 #include "src/drivers/driver_registry.h"
+#include "src/drivers/weak_pull_meter.h"
 
 // Safety scope: plain INPUT (high impedance) only means the firmware is not
 // driving the probes. It is NOT protection against shorts, overvoltage, ESD
@@ -27,7 +29,10 @@
 // finite resistance; the digital test cannot tell which) never authorises
 // powered drive across it; it is measured by weak-pull (passive) drivers
 // instead. Seeing no coupling never authorises anything either.
-// Inconsistent readings are retried, then treated as "unknown".
+// Inconsistent readings are retried, then treated as "unknown". The one
+// narrow exception (decideCoupling()): an open-drain Supply3V3 four-wire
+// candidate whose VCC is coupled only to its signals, where weak-pull ADC
+// measurements in this observation cycle show a supported pull-up network.
 //
 // The engine owns pins, power, prechecks, scheduling, confirmation and
 // removal. Drivers (sensor_driver.h) are chosen by capabilities only; this
@@ -146,6 +151,7 @@ enum class State : uint8_t {
   Idle,          // probes INPUT, waiting idleDelayMs before discovery
   Precheck,      // weak-pull diagnostic, one pull-up source node at a time
   Prepare,       // check the attempt is permitted, apply its excitation
+  Classify,      // weak-pull ADC measurement of the pairs the coupling policy needs
   Stabilizing,   // driver's powerStabilizeMs before the first probe() call
   Probing,       // driver probe() operation in progress
   Confirming,    // candidate kept, waiting for the next acquisition slot
@@ -178,6 +184,18 @@ uint8_t twoTerminalHits = 0;     // pairs that behaved as a two-terminal part
 size_t twoTerminalHitIndex = 0;
 bool cycleMeasurementError = false;
 ProbeStatus status;
+
+// Pair classification for the coupling policy. Scoped to one precheck
+// pass (cleared when the next pass starts), so evidence never outlives a
+// power, mapping or socket change: every attempt runs its own precheck.
+WeakPullMeter classifyMeter;
+uint8_t classifyPending = 0;  // PROBE_PAIRS bits still to measure
+uint8_t classifyPair = 0;     // PROBE_PAIRS index being measured
+bool classifyReversed = false;
+uint16_t classifyMv[2];
+uint16_t classifySpread[2];
+uint8_t measuredPairs = 0;    // PROBE_PAIRS bits classified in this pass
+PairEvidence evidence[PROBE_PAIR_COUNT];
 
 bool elapsed(uint32_t now, uint32_t since, uint32_t interval) {
   return now - since >= interval;  // unsigned: correct across millis() rollover
@@ -344,11 +362,12 @@ SensorDriver *currentDriver() {
   return attemptAt(attemptIndex, a) ? a.driver : nullptr;
 }
 
-// Powered drive is never applied across an observed coupled path. A driven
-// node must show no coupling to any other node (unused ones included):
+// The existing rule: powered drive is never applied across an observed
+// coupled path. A driven node must show no coupling to any other node
+// (unused ones included):
 //   * VCC always: a coupled VCC path is a known or suspected low-impedance
-//     supply path (to GND or into a signal the host sinks), and a finite
-//     resistance cannot be told from a short here;
+//     supply path (to GND or into a signal the host sinks), and the
+//     digital test cannot tell a finite resistance from a short;
 //   * SIG1/SIG2 too unless the driver declares them open-drain: a
 //     push-pull signal (ultrasonic TRIG; ECHO is sensor-driven) coupled to
 //     anything is contention, so any coupling vetoes those mappings.
@@ -369,15 +388,30 @@ bool drivenPathsUncoupled(const ProbeMapping &m, uint8_t coupled, bool openDrain
   return true;
 }
 
-// nullptr if the attempt may be prepared, else why not.
+// The capability combination the pull-up exception exists for: an
+// engine-switched 3.3 V four-wire supply whose two signals are only ever
+// released or sunk (I2C-like). Never a driver name.
+bool pullupExceptionEligible(const DriverRequirements &r) {
+  return r.topology == ProbeTopology::FourWirePowered && r.excitation == ExcitationPolicy::ProtectedActive &&
+         r.supply == SupplyProfile::Supply3V3 && r.openDrainSignals;
+}
+
+// Index into PROBE_PAIRS of the pair of nodes x and y, or -1.
+int pairIndex(int x, int y) {
+  if (x < 0 || y < 0) return -1;
+  const uint8_t bit = probePairBit(static_cast<uint8_t>(x), static_cast<uint8_t>(y));
+  for (int i = 0; i < PROBE_PAIR_COUNT; i++) {
+    if (bit == (1u << i)) return i;
+  }
+  return -1;
+}
+
+// nullptr if the attempt's capabilities and supply are permitted, else why
+// not. The coupling policy (decideCoupling()) comes after this.
 const char *attemptBlockReason(const DriverRequirements &r, const ProbeMapping &m) {
   if (!supported(r) || r.topology != m.topology || !topologyEnabled(r.topology)) return "not-permitted";
   if (powerPath(r) == PowerPath::Unavailable) return "hardware-required";
-  if (r.excitation == ExcitationPolicy::ProtectedActive &&
-      !drivenPathsUncoupled(m, status.coupledPairs, r.openDrainSignals)) {
-    return "blocked-by-precheck";
-  }
-  return nullptr;  // WeakPullOnly: coupling is exactly what it measures
+  return nullptr;
 }
 
 ProbeContext contextFor(const ProbeMapping &m) {
@@ -534,6 +568,8 @@ void startPrecheckPass(uint32_t now) {
   precheckSource = 0;
   precheckSample = 0;
   precheckCoupled = 0;
+  measuredPairs = 0;  // a new observation cycle: earlier classifications are void
+  memset(evidence, 0, sizeof evidence);
   applyPrecheckPulls(precheckSource);
   enter(State::Precheck, now);
 }
@@ -598,6 +634,76 @@ void tickPrecheck(uint32_t now) {
   status.precheck = precheckCoupled != 0 ? PrecheckResult::CouplingObserved
                                          : PrecheckResult::NoObviousCoupling;
   enter(State::Prepare, now);
+}
+
+// ---- Pair classification (weak-pull ADC, supply off) -------------------------
+
+// One orientation of PROBE_PAIRS[classifyPair]: sense on its first
+// terminal (reversed: its second), open-drain sink on the other. The
+// other two nodes stay plain INPUT. False if the ADC could not be set up.
+bool startClassifyOrientation(bool reversed) {
+  classifyReversed = reversed;
+  const ProbeMapping &p = PROBE_PAIRS[classifyPair];
+  const uint8_t first = gpioWithRole(p, NodeRole::Terminal, 0);
+  const uint8_t second = gpioWithRole(p, NodeRole::Terminal, 1);
+  return classifyMeter.start(reversed ? second : first, reversed ? first : second, PULLUP_CLASSIFY_SETTLE_MS);
+}
+
+// Starts the next pending pair (a pair whose ADC setup fails stays a
+// MeasurementError), or restores every node and returns to Prepare.
+void startNextPair(uint32_t now) {
+  while (classifyPending != 0) {
+    classifyPair = 0;
+    while ((classifyPending & (1u << classifyPair)) == 0) classifyPair++;
+    classifyPending &= static_cast<uint8_t>(~(1u << classifyPair));
+    measuredPairs |= static_cast<uint8_t>(1u << classifyPair);
+    evidence[classifyPair] = PairEvidence{CouplingClassification::MeasurementError, {0, 0}};
+    if (startClassifyOrientation(false)) return;
+  }
+  resetTestPins();  // baseline: every node plain INPUT, pulls off, supply off
+  enter(State::Prepare, now);
+}
+
+// Every node plain INPUT and the supply off first: nothing is powered
+// while a pair is classified.
+void beginClassification(uint8_t pairs, uint32_t now) {
+  resetTestPins();
+  classifyPending = pairs;
+  enter(State::Classify, now);
+  startNextPair(now);
+}
+
+void tickClassify(uint32_t now) {
+  const WeakPullMeter::Result result = classifyMeter.advance();
+  if (result == WeakPullMeter::Result::Pending) return;
+  if (result == WeakPullMeter::Result::Done) {
+    const int o = classifyReversed ? 1 : 0;
+    classifyMv[o] = classifyMeter.meanMv();
+    classifySpread[o] = classifyMeter.spreadMv();
+    if (!classifyReversed) {
+      if (startClassifyOrientation(true)) return;  // a setup failure leaves MeasurementError
+    } else {
+      evidence[classifyPair] = PairEvidence{classifyCouplingPair(classifyMv, classifySpread),
+                                            {classifyMv[0], classifyMv[1]}};
+    }
+  }
+  startNextPair(now);  // Failed keeps MeasurementError: never a 0 mV reading
+}
+
+// Kept for the Serial log when the decision involved coupling.
+void recordEvaluation(const SensorDriver *driver, const ProbeMapping &m, const CouplingDecision &d) {
+  CouplingEvaluation &e = status.evaluation;
+  const DriverRequirements &r = driver->getRequirements();
+  e.serial++;
+  e.mapping = m;
+  e.driverName = driver->getName();
+  e.signalLabel[0] = r.signalLabel[0];
+  e.signalLabel[1] = r.signalLabel[1];
+  e.coupledPairs = status.coupledPairs;
+  e.measuredPairs = measuredPairs;
+  memcpy(e.pair, evidence, sizeof e.pair);
+  e.verdict = d.verdict;
+  memcpy(e.reason, d.reason, sizeof e.reason);
 }
 
 // ---- Discovery flow ------------------------------------------------------------
@@ -781,6 +887,10 @@ void step(uint32_t now) {
       tickPrecheck(now);
       break;
 
+    case State::Classify:
+      tickClassify(now);
+      break;
+
     case State::Prepare: {
       SensorDriver *driver = currentDriver();
       const ProbeMapping *m = currentMapping();
@@ -788,11 +898,30 @@ void step(uint32_t now) {
         enterFault(now);
         break;
       }
-      if (const char *blocked = attemptBlockReason(driver->getRequirements(), *m)) {
+      const DriverRequirements &req = driver->getRequirements();
+      // 1. Capabilities, enabled topology and an eligible supply profile.
+      if (const char *blocked = attemptBlockReason(req, *m)) {
         onAttemptBlocked(now, blocked);
         break;
       }
-      if (!prepareExcitation(driver->getRequirements(), *m)) {
+      // 2-4. Coupling policy (WeakPullOnly: coupling is exactly what it measures).
+      if (req.excitation == ExcitationPolicy::ProtectedActive) {
+        const CouplingDecision d = decideCoupling(req, *m, status.coupledPairs, measuredPairs, evidence);
+        if (d.verdict == CouplingVerdict::NeedsMeasurement) {
+          beginClassification(d.measure, now);  // back here when done, still unpowered
+          break;
+        }
+        if (d.verdict != CouplingVerdict::Allowed) recordEvaluation(driver, *m, d);
+        if (d.verdict == CouplingVerdict::Blocked) {
+          for (int i = 0; i < PROBE_PAIR_COUNT; i++) {
+            if (evidence[i].classification == CouplingClassification::MeasurementError) cycleMeasurementError = true;
+          }
+          onAttemptBlocked(now, "blocked-by-precheck");
+          break;
+        }
+      }
+      // 5. The existing power-and-probe sequence.
+      if (!prepareExcitation(req, *m)) {
         onAttemptFailed(now, "backend-refused");  // torn down; next attempt or retry
         break;
       }
@@ -891,19 +1020,6 @@ void publish(const ProbeStatus &before) {
   if (!sameForDisplay(before, status)) status.revision++;
 }
 
-const char *roleName(NodeRole role, const char *const *signalLabel) {
-  switch (role) {
-    case NodeRole::Vcc: return "VCC";
-    case NodeRole::Data: return "DAT";
-    case NodeRole::Gnd: return "GND";
-    case NodeRole::Terminal: return "T";
-    case NodeRole::Sig1: return signalLabel != nullptr && signalLabel[0] != nullptr ? signalLabel[0] : "S1";
-    case NodeRole::Sig2: return signalLabel != nullptr && signalLabel[1] != nullptr ? signalLabel[1] : "S2";
-    case NodeRole::Unused: break;
-  }
-  return "---";
-}
-
 // Appends "X:role" to buf, space-separated; truncates, always terminated.
 void appendNode(char *buf, size_t len, int node, const char *role) {
   const size_t used = strlen(buf);
@@ -915,6 +1031,7 @@ void appendNode(char *buf, size_t len, int node, const char *role) {
 }  // namespace
 
 void resetTestPins() {
+  classifyMeter.release();  // a pair classification in progress: sink and pull-up off
   // Plain INPUT: output driver off, internal pull-up and pull-down off.
   for (uint8_t pin : PROBE_NODE_GPIO) pinMode(pin, INPUT);
   // Then the external four-wire supply and routes, after the signals, so a
@@ -1001,8 +1118,167 @@ void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLa
     return;
   }
   for (int n = 0; n < PROBE_NODE_COUNT; n++) {  // A, B on the first half; C, D on the second
-    appendNode(n < PROBE_NODE_COUNT / 2 ? first : second, len, n, roleName(mapping.role[n], signalLabel));
+    appendNode(n < PROBE_NODE_COUNT / 2 ? first : second, len, n, probeRoleName(mapping.role[n], signalLabel));
   }
+}
+
+const char *probeRoleName(NodeRole role, const char *const *signalLabel) {
+  switch (role) {
+    case NodeRole::Vcc: return "VCC";
+    case NodeRole::Data: return "DAT";
+    case NodeRole::Gnd: return "GND";
+    case NodeRole::Terminal: return "T";
+    case NodeRole::Sig1: return signalLabel != nullptr && signalLabel[0] != nullptr ? signalLabel[0] : "S1";
+    case NodeRole::Sig2: return signalLabel != nullptr && signalLabel[1] != nullptr ? signalLabel[1] : "S2";
+    case NodeRole::Unused: break;
+  }
+  return "---";
+}
+
+// ---- Coupling policy -------------------------------------------------------------
+
+static_assert(PASSIVE_CONTACT_MAX_MV < PULLUP_COMPATIBLE_MIN_MV &&
+                  PULLUP_COMPATIBLE_MIN_MV <= PULLUP_COMPATIBLE_MAX_MV &&
+                  PULLUP_COMPATIBLE_MAX_MV < PASSIVE_OPEN_MIN_MV,
+              "the pull-up band must sit above the contact band and below the open band");
+static_assert(PULLUP_SERIES_TOLERANCE_PCT > 0 && PULLUP_SERIES_TOLERANCE_PCT < 100,
+              "series tolerance is a percentage");
+
+CouplingClassification classifyCouplingPair(const uint16_t mv[2], const uint16_t spreadMv[2]) {
+  // Contact-like in either direction: if it conducts that well one way,
+  // powered drive could push current that way. Never a pull-up.
+  if (mv[0] <= PASSIVE_CONTACT_MAX_MV || mv[1] <= PASSIVE_CONTACT_MAX_MV) {
+    return CouplingClassification::LowImpedance;
+  }
+  if (spreadMv[0] > PASSIVE_STABLE_SPREAD_MV || spreadMv[1] > PASSIVE_STABLE_SPREAD_MV) {
+    return CouplingClassification::Ambiguous;  // unstable (noise, charging capacitance)
+  }
+  const uint32_t mean = (static_cast<uint32_t>(mv[0]) + mv[1]) / 2;
+  const uint32_t pct = mean * PASSIVE_SYMMETRY_PCT / 100;
+  const uint32_t tolerance = pct > PASSIVE_SYMMETRY_MIN_DELTA_MV ? pct : PASSIVE_SYMMETRY_MIN_DELTA_MV;
+  const uint32_t delta = mv[0] > mv[1] ? mv[0] - mv[1] : mv[1] - mv[0];
+  if (delta > tolerance) return CouplingClassification::Ambiguous;  // directional: junctions, regulators
+  if (mean >= PASSIVE_OPEN_MIN_MV) return CouplingClassification::OpenLike;  // no finite path seen
+  if (mean >= PULLUP_COMPATIBLE_MIN_MV && mean <= PULLUP_COMPATIBLE_MAX_MV) {
+    return CouplingClassification::PullupCompatible;
+  }
+  return CouplingClassification::Resistive;
+}
+
+bool pullupSeriesExplained(uint16_t vccSig1Mv, uint16_t vccSig2Mv, uint16_t sig1Sig2Mv) {
+  uint32_t r1 = 0, r2 = 0, r12 = 0;
+  if (!passiveEstimateOhms(vccSig1Mv, r1) || !passiveEstimateOhms(vccSig2Mv, r2) ||
+      !passiveEstimateOhms(sig1Sig2Mv, r12)) {
+    return false;  // a bound, not a value: nothing to compare
+  }
+  // The estimates share the nominal pull-up, so its absolute error cancels
+  // in this comparison; pin-to-pin mismatch and ADC error remain.
+  const uint32_t sum = r1 + r2;
+  const uint32_t tolerance = sum * PULLUP_SERIES_TOLERANCE_PCT / 100;
+  return r12 + tolerance >= sum && r12 <= sum + tolerance;
+}
+
+// A Blocked decision with a formatted (compiler-checked) reason.
+static CouplingDecision blockedBy(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static CouplingDecision blockedBy(const char *format, ...) {
+  CouplingDecision d{CouplingVerdict::Blocked, 0, ""};
+  va_list args;
+  va_start(args, format);
+  vsnprintf(d.reason, sizeof d.reason, format, args);
+  va_end(args);
+  return d;
+}
+
+CouplingDecision decideCoupling(const DriverRequirements &r, const ProbeMapping &m, uint8_t coupled,
+                                uint8_t measured, const PairEvidence pairEvidence[]) {
+  const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
+  const int gnd = probeNodeWithRole(m, NodeRole::Gnd);
+  if (vcc < 0 || gnd < 0) return blockedBy("no supply mapping");
+
+  // The rail: VCC-GND coupling is vetoed for every powered candidate and
+  // is never reclassified, whatever another pair looks like.
+  if ((coupled & probePairBit(static_cast<uint8_t>(vcc), static_cast<uint8_t>(gnd))) != 0) {
+    return blockedBy("VCC-GND coupling");
+  }
+  // The existing rule: nothing coupled to a driven path.
+  if (drivenPathsUncoupled(m, coupled, r.openDrainSignals)) return CouplingDecision{CouplingVerdict::Allowed, 0, ""};
+  if (!pullupExceptionEligible(r)) {
+    return blockedBy(!drivenPathsUncoupled(m, coupled, true) ? "VCC coupling" : "push-pull signal coupling");
+  }
+
+  // Eligible, and its VCC is coupled to SIG1 and/or SIG2 only (four-wire
+  // uses every node; digital VCC-GND coupling was vetoed above). Pull-ups
+  // go to VCC, so a coupled signal-GND pair is not explained by them.
+  const char *l1 = probeRoleName(NodeRole::Sig1, r.signalLabel);
+  const char *l2 = probeRoleName(NodeRole::Sig2, r.signalLabel);
+  const int s1 = probeNodeWithRole(m, NodeRole::Sig1);
+  const int s2 = probeNodeWithRole(m, NodeRole::Sig2);
+  const int rail = pairIndex(vcc, gnd);
+  const int a = pairIndex(vcc, s1);
+  const int b = pairIndex(vcc, s2);
+  const int ab = pairIndex(s1, s2);
+  const int ga = pairIndex(s1, gnd);
+  const int gb = pairIndex(s2, gnd);
+  if (rail < 0 || a < 0 || b < 0 || ab < 0 || ga < 0 || gb < 0) return blockedBy("no signal mapping");
+  if ((coupled & ((1u << ga) | (1u << gb))) != 0) return blockedBy("signal-GND coupling unexplained");
+
+  // The rail is measured too: the pull-ups load the precheck's weak
+  // pull-down nodes, so a VCC-GND short can read LOW (uncoupled) there.
+  const uint8_t needed = static_cast<uint8_t>((1u << rail) | (1u << a) | (1u << b) | (1u << ab));
+  if ((measured & needed) != needed) {
+    return CouplingDecision{CouplingVerdict::NeedsMeasurement, static_cast<uint8_t>(needed & ~measured), ""};
+  }
+
+  const CouplingClassification cr = pairEvidence[rail].classification;
+  const CouplingClassification ca = pairEvidence[a].classification;
+  const CouplingClassification cb = pairEvidence[b].classification;
+  const CouplingClassification cab = pairEvidence[ab].classification;
+  if (cr == CouplingClassification::MeasurementError || ca == CouplingClassification::MeasurementError ||
+      cb == CouplingClassification::MeasurementError || cab == CouplingClassification::MeasurementError) {
+    return blockedBy("ADC measurement unavailable");
+  }
+  // Rail: only open, or finite and well above a short, in both directions.
+  if (cr == CouplingClassification::LowImpedance) return blockedBy("VCC-GND low impedance");
+  if (cr == CouplingClassification::Ambiguous || cr == CouplingClassification::Unclassified) {
+    return blockedBy("VCC-GND evidence ambiguous");
+  }
+  if (ca == CouplingClassification::LowImpedance) return blockedBy("VCC-%s low impedance", l1);
+  if (cb == CouplingClassification::LowImpedance) return blockedBy("VCC-%s low impedance", l2);
+  if (cab == CouplingClassification::LowImpedance) return blockedBy("%s-%s low impedance", l1, l2);
+  if (ca != CouplingClassification::PullupCompatible) {
+    return blockedBy(ca == CouplingClassification::Resistive ? "VCC-%s outside pull-up range"
+                                                             : "pull-up classification ambiguous (VCC-%s)",
+                     l1);
+  }
+  if (cb != CouplingClassification::PullupCompatible) {
+    return blockedBy(cb == CouplingClassification::Resistive ? "VCC-%s outside pull-up range"
+                                                             : "pull-up classification ambiguous (VCC-%s)",
+                     l2);
+  }
+  // Two pull-ups to one VCC also join SIG1 and SIG2 through each other; a
+  // signal-to-signal path that does not match them in series (a direct
+  // short, another network) is not explained.
+  auto mean = [pairEvidence](int i) {
+    return static_cast<uint16_t>((pairEvidence[i].mv[0] + pairEvidence[i].mv[1]) / 2);
+  };
+  const bool finite = cab == CouplingClassification::PullupCompatible || cab == CouplingClassification::Resistive;
+  if (!finite || !pullupSeriesExplained(mean(a), mean(b), mean(ab))) {
+    return blockedBy("%s-%s path not explained by pull-ups", l1, l2);
+  }
+  return CouplingDecision{CouplingVerdict::PullupException, 0, "open-drain pull-up exception"};
+}
+
+const char *couplingClassificationName(CouplingClassification c) {
+  switch (c) {
+    case CouplingClassification::Unclassified: return "unclassified";
+    case CouplingClassification::PullupCompatible: return "pullup-compatible";
+    case CouplingClassification::Resistive: return "resistive";
+    case CouplingClassification::LowImpedance: return "low-impedance";
+    case CouplingClassification::OpenLike: return "open-like";
+    case CouplingClassification::Ambiguous: return "ambiguous";
+    case CouplingClassification::MeasurementError: return "measurement-error";
+  }
+  return "unknown";
 }
 
 const char *probePhaseName(ProbePhase phase) {

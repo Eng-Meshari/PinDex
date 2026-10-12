@@ -52,6 +52,7 @@ it identified, and get its pinout.
 | `src/drivers/i2c_driver.h/.cpp` | `I2cDriver`: incremental 0x08–0x77 address sweeps, two-sweep confirmation, round-robin liveness checks, address hints. |
 | `src/drivers/i2c_bus.h/.cpp` | The only I2C controller code: exclusive owner of `Wire1`, return-code mapping, idle-line checks, release. |
 | `src/drivers/passive_driver.h/.cpp` | `PassiveDriver`: weak-pull two-terminal measurement, classification, switch debouncing, guided LDR mode. |
+| `src/drivers/weak_pull_meter.h/.cpp` | One weak-pull divider measurement of a pair in one orientation (pull-up verified, open-drain sink), shared by `PassiveDriver` and the engine's pull-up classification. |
 | `src/drivers/passive_adc.h/.cpp` | The only ADC code: ESP-IDF oneshot ADC (both ADC units) with pull-up control and error checking. |
 | `src/drivers/driver_registry.h/.cpp` | The static driver table (priority order) and its read-only API. |
 | `dht11.h/.cpp` | Pure DHT11 frame decoding (timing → bits → bytes → values); no GPIO, host-testable. |
@@ -223,7 +224,7 @@ instead of latching a fault:
 | Observation | Weak-pull passive measurement | Three-wire (GPIO) powered probing | Four-wire probing |
 |---|---|---|---|
 | No pulled-down node read HIGH (`NoObviousCoupling`) | Runs | Runs (behind the protected interface) | Runs **only** with an eligible supply profile; the precheck grants nothing |
-| A pulled-down node read HIGH: that pair is coupled (`CouplingObserved`) | Runs; the ADC tells contact from resistance | **Blocked across that path**: a mapping is skipped if its VCC node is coupled to any other node | I2C: as three-wire. Ultrasonic: **every mapping blocked** (see below) |
+| A pulled-down node read HIGH: that pair is coupled (`CouplingObserved`) | Runs; the ADC tells contact from resistance | **Blocked across that path**: a mapping is skipped if its VCC node is coupled to any other node | I2C: as three-wire, except the measured [pull-up exception](#narrow-open-drain-pull-up-exception). Ultrasonic: **every mapping blocked** (see below) |
 | Readings changed between samples (`InconsistentReadings`) | Retried up to `PRECHECK_MAX_RETRIES` times, then **unknown**: nothing runs this cycle | Same: no safety is inferred | Same |
 | ADC or configuration failure (passive driver) | Measurement stops, pins reset, the attempt fails | No fallback permission | No fallback permission |
 
@@ -253,9 +254,93 @@ mid-rail divider that may read either way, and a short across three or
 more nodes reads LOW. LOW readings never prove there is no short. A
 module's DATA pull-up resistor, an I2C breakout's SDA/SCL pull-ups to its
 VCC pin, or a chip's ESD diodes can also look like coupling, which blocks
-the matching powered mappings (often the right one). That is deliberate:
-a finite resistance is never converted into permission. The external
-protection remains necessary either way.
+the matching powered mappings (often the right one). A digital reading is
+never converted into permission. The one narrow, measured exception is
+described next. The external protection remains necessary either way.
+
+### Narrow open-drain pull-up exception
+
+An I2C breakout's own SDA/SCL pull-ups connect its VCC pin to both signal
+lines. If the digital precheck flags those paths, the rule above would
+veto the breakout's correct mapping. The engine (`decideCoupling()` in
+`probe_engine.cpp`) therefore makes one exception, in this order:
+
+1. **Permissions first.** The candidate must already be runnable:
+   - an enabled topology;
+   - an eligible supply (protected 3.3 V backend, or the experimental GPIO
+     profile when it is enabled). The exception never enables a disabled
+     profile.
+2. **Capabilities, never a name.** It applies only to a
+   `FourWirePowered + ProtectedActive + Supply3V3` candidate with
+   open-drain signals (today: the I2C scanner).
+3. **Rail.** Digital VCC–GND coupling is always vetoed, as before. A
+   coupled SIG–GND pair also rules the exception out, because pull-ups do
+   not explain it.
+4. **Measure.** With every supply off and every other node plain INPUT,
+   four pairs are measured in both orientations: VCC–GND, VCC–SDA,
+   VCC–SCL and SDA–SCL. The measurement is the passive driver's
+   weak-pull meter: the internal pull-up is verified, the sink is
+   open-drain LOW only, and nothing is ever driven HIGH. Pins are restored
+   after each orientation and on cancellation. Evidence belongs to that one
+   precheck pass, so every attempt and every retry measures again.
+5. **Classify and decide.** The mapping is allowed only if all of these
+   hold:
+   - VCC–GND reads open, or finite and well above a short. The rail is
+     measured because the pull-ups can mask a rail short from the digital
+     test.
+   - VCC–SDA and VCC–SCL are both stable, symmetric and inside the pull-up
+     band.
+   - SDA–SCL matches the two pull-ups in series, within
+     `PULLUP_SERIES_TOLERANCE_PCT`.
+
+   Then the usual power-up and I2C scan run unchanged.
+
+| Measured | Decision |
+|---|---|
+| Digital VCC–GND coupling | Vetoed, never measured |
+| VCC–GND contact-band in either direction, unstable or directional | Blocked (`VCC-GND low impedance` / `evidence ambiguous`) |
+| VCC–SDA/SCL inside 170–900 mV, stable, symmetric | Eligible |
+| VCC–SDA/SCL contact band (≤ 150 mV) in either direction | Blocked (`low impedance`) |
+| VCC–SDA/SCL unstable, directional, open-like, or outside the band | Blocked (`ambiguous` / `outside pull-up range`) |
+| SDA–SCL contact band | Blocked (`SDA-SCL low impedance`) |
+| SDA–SCL finite but not the series sum (another path) | Blocked (`not explained by pull-ups`) |
+| Any ADC failure or unverified pull-up | Blocked (`ADC measurement unavailable`) |
+| Digital coupling with nothing measured | Never a pass |
+
+The bands in `config.h` (`PULLUP_COMPATIBLE_MIN/MAX_MV`) are meant to cover
+4.7–10 kΩ pull-ups. They were derived **on paper**, assuming a 30–67 kΩ
+internal pull-up (nominally 45 kΩ, not a precision reference) and about
+±40 mV ADC error. They have **not** been validated on hardware.
+Narrowing them only makes the policy stricter.
+
+Several real-world cases are blocked, which is the conservative outcome:
+- pull-ups below about 2.5 kΩ;
+- pull-ups behind an on-board regulator, where the path is directional;
+- large decoupling capacitance that is still charging;
+- a VCC–GND path that is directional.
+
+Readings through an unpowered module's internal circuitry are
+approximate, never resistor values.
+
+Passing only means the policy did not veto the attempt. It does not
+certify the wiring as safe. Open-drain signalling does not prevent
+contention with a supply short; only the measured resistance limits that
+current. Outside the exception, SDA–SCL coupling with an uncoupled VCC is
+still allowed exactly as before: both lines are open-drain, and the scan
+fails on a shorted bus.
+
+Serial shows each blocked evaluation (at most one per
+`PRECHECK_LOG_INTERVAL_MS`) and every allowed one. This example is for
+illustration; the values are not from a measurement:
+
+```text
+precheck: A:VCC B:GND C:SDA D:SCL (I2C Device)
+precheck: A-B VCC-GND not-coupled -> open-like 3100/3100 mV
+precheck: A-C VCC-SDA coupled -> pullup-compatible 313/314 mV
+precheck: A-D VCC-SCL coupled -> pullup-compatible 313/313 mV
+precheck: C-D SDA-SCL coupled -> pullup-compatible 571/571 mV
+candidate: allowed; open-drain pull-up exception
+```
 
 The latched *Socket rejected* fault and the `r` retry still exist, but only
 for internal faults. Coupling no longer latches it.
@@ -369,8 +454,10 @@ up, and many breakouts draw more than a GPIO can source.
 - The controller drives SDA and SCL open-drain only; neither is ever
   push-pull HIGH.
 - Breakout pull-ups between VCC and SDA/SCL may be seen by the precheck
-  as VCC coupling, which vetoes those mappings, possibly the right one
-  (see [Precheck routing](#precheck-routing-diagnostic-heuristic-only)).
+  as VCC coupling. Such a mapping is then powered only if weak-pull ADC
+  measurements show a supported pull-up network (see
+  [Narrow open-drain pull-up exception](#narrow-open-drain-pull-up-exception));
+  otherwise it stays vetoed.
 
 ### Bus ownership
 
@@ -1213,6 +1300,30 @@ contracts against these simulations:
   critical section, or supply removed while the controller still runs;
 - fake drivers that exercise the architecture.
 
+Coverage added for the pull-up exception includes:
+- the classifier: 4.7k and 10k, internal pull-up spread, near-zero in
+  either direction, noise, directional readings, open, out of band;
+- the series check: two pull-ups versus another path, a short, or open;
+- the policy on all 24 mappings, which evaluate their own physical pairs
+  (only VCC A / GND B qualifies);
+- every veto reason, including "measured" pairs with nothing classified;
+- capability combinations: 5 V, push-pull, DHT11, and a fake driver with
+  the I2C capabilities;
+- through the engine:
+  - a mocked 0x3C reaching the snapshot with the right roles, and SDA–SCL
+    and VCC–SDA/SCL/GND shorts;
+  - a rail problem the digital test missed;
+  - ADC failure and unavailability, noise and asymmetry;
+  - re-measurement on every retry, and cancellation mid-measurement;
+  - the GPIO profile, and the disabled profile never measuring;
+  - DHT11 and passive detection afterwards;
+  - two global guards: no sensing ever starts with a supply on, and
+    nothing goes push-pull while a pad is sensed.
+
+The simulator can weaken its pull-downs (`net.pulldownOhms`) so the
+digital precheck flags a pull-up network. With equal 45 kΩ pulls it reads
+LOW, so whether real hardware flags one is itself unverified.
+
 Coverage added in Phase 5 includes: I2C role text on all 24 mappings,
 the supply profiles (3.3 V vs 5 V backend, partial capabilities, the GPIO
 profile off and on, the powered setting overriding it), the precheck
@@ -1250,7 +1361,7 @@ it and against the core sources, not by these tests. The tests need a
 host C++17 compiler (not the ESP32 toolchain). From the `PinDex` folder:
 
 ```text
-SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp"
+SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp src/drivers/weak_pull_meter.cpp"
 F="-std=c++17 -Wall -Wextra -Itests/mock -I."
 g++ $F -DPINDEX_POWERED_PROBING_ENABLED=1 -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=0 $SRC -o build/test_all
 g++ $F -DPINDEX_POWERED_PROBING_ENABLED=1 -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=1 $SRC -o build/test_i2c_gpio
