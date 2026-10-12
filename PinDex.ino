@@ -21,6 +21,7 @@ static uint32_t shownRevision = 0;
 static uint32_t loggedRevision = 0;
 static bool loggedDetected = false;
 static uint32_t loggedEvaluation = 0;
+static uint16_t loggedInconclusive = 0;
 static unsigned long lastBlockedLogMs = 0;
 static bool blockedLogged = false;
 
@@ -59,6 +60,10 @@ static void logProbeStatus(const ProbeStatus &s) {
   }
   if (s.consecutiveFailures > 0) Serial.printf(" fails=%u", (unsigned)s.consecutiveFailures);
   if (s.lastError != nullptr) Serial.printf(" err=%s", s.lastError);
+  // Skipped attempts were never tested: not evidence of an empty socket.
+  if (s.inconclusiveCount > 0 && (s.phase == ProbePhase::Scanning || s.phase == ProbePhase::NoComponent)) {
+    Serial.printf(" inconclusive=%u/%u", (unsigned)s.inconclusiveCount, (unsigned)s.scanTotal);
+  }
   if (s.measurementUnavailable) Serial.print(" measurement-unavailable");
   for (size_t i = 0; i < sensorDriverCount() && i < 8; i++) {
     if (s.hardwareRequiredMask & (1u << i)) Serial.printf(" hw-required=[%s]", sensorDriverAt(i)->getName());
@@ -184,6 +189,11 @@ void loop() {
     loggedEvaluation = probe.evaluation.serial;
     logEvaluation(probe.evaluation, now);
   }
+  if (probe.inconclusiveCount > loggedInconclusive) {  // one line per skip; the status line follows
+    Serial.printf("precheck: attempt %u/%u inconsistent; retries exhausted; skipping\n",
+                  (unsigned)probe.inconclusiveAttempt, (unsigned)probe.scanTotal);
+  }
+  loggedInconclusive = probe.inconclusiveCount;
   if (probe.revision != loggedRevision) {
     loggedRevision = probe.revision;
     logProbeStatus(probe);

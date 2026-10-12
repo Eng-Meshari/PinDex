@@ -381,6 +381,51 @@ static bool anyProbeIsrAttached() {
   return false;
 }
 
+// Precheck log: 'P' when a pull configuration is complete, 'S' when a sample
+// set starts (node A read), stamped with the engine's millis() of that tick.
+// Only the precheck pulls one probe node up and the other three down.
+struct PrecheckEvent {
+  char kind;
+  int source;   // the pulled-up node
+  uint32_t ms;
+};
+static PrecheckEvent precheckLog[1024];
+static int precheckEvents = 0;
+static int pullSource = -1;  // current precheck configuration, -1 = none
+static uint32_t tickMs = 0;  // millis() the engine sees in the current tick
+
+static int precheckPullSource() {
+  int source = -1;
+  for (int n = 0; n < PROBE_NODE_COUNT; n++) {
+    const uint8_t mode = mock::pins[gpioOf(n)].mode;
+    if (mode == INPUT_PULLUP && source < 0) {
+      source = n;
+    } else if (mode != INPUT_PULLDOWN) {
+      return -1;
+    }
+  }
+  return source;
+}
+
+static void logPrecheck(char kind) {
+  if (precheckEvents < 1024) precheckLog[precheckEvents++] = PrecheckEvent{kind, pullSource, tickMs};
+}
+
+// Sample sets sooner than PRECHECK_SETTLE_MS after their pull change or
+// PRECHECK_SAMPLE_INTERVAL_MS after the previous set (e.g. a catch-up burst),
+// or taken under another configuration. Unsigned: valid across rollover.
+[[maybe_unused]] static int precheckPacingViolations() {
+  int violations = precheckEvents > 0 && precheckLog[0].kind != 'P' ? 1 : 0;
+  for (int i = 1; i < precheckEvents; i++) {
+    const PrecheckEvent &e = precheckLog[i];
+    const PrecheckEvent &prev = precheckLog[i - 1];
+    if (e.kind != 'S') continue;
+    const uint32_t wait = prev.kind == 'P' ? PRECHECK_SETTLE_MS : PRECHECK_SAMPLE_INTERVAL_MS;
+    if (e.source != prev.source || static_cast<uint32_t>(e.ms - prev.ms) < wait) violations++;
+  }
+  return violations;
+}
+
 // The context the engine hands a driver for mapping m.
 static ProbeContext contextOf(const ProbeMapping &m) {
   auto pin = [&m](NodeRole role, int nth) {
@@ -445,6 +490,7 @@ static void advanceTo(uint64_t untilUs);  // delivers simulated ECHO edges (belo
 // One loop() iteration per simulated millisecond.
 static void tick() {
   advanceTo(mock::nowUs + 1000);
+  tickMs = millis();
   probeTick();
   if (mock::criticalDepth != 0) lockLeaks++;
 }
@@ -985,6 +1031,11 @@ bool i2cBusEnd() {
 // Called after every pinMode()/digitalWrite().
 static void onPinChange(uint8_t pin, bool isPinMode) {
   if (isPinMode && mock::criticalDepth != 0) lockedPinModes++;
+  if (nodeOf(pin) >= 0) {
+    const bool wasPrecheck = pullSource >= 0;
+    pullSource = precheckPullSource();
+    if (pullSource >= 0 && !wasPrecheck) logPrecheck('P');
+  }
   if (nodeOf(pin) >= 0 && mock::drivesHigh(pin)) highDriveEvents++;
   if (nodeOf(pin) >= 0 && mock::isOutput(pin) && !(mock::pins[pin].mode & OPEN_DRAIN)) {
     for (uint8_t g : PROBE_NODE_GPIO) {
@@ -1023,6 +1074,7 @@ static void onPinChange(uint8_t pin, bool isPinMode) {
 }
 
 static int readHook(uint8_t pin) {
+  if (pin == gpioOf(0) && pullSource >= 0) logPrecheck('S');
   if (sonar.attached && pin == sonarGpio(NodeRole::Sig2)) return sonar.stuckHigh ? HIGH : sonar.level;
   if (sensor.attached && pin == wiringGpio(NodeRole::Data)) {
     if (sensor.stuckLow) return LOW;
@@ -1051,6 +1103,9 @@ static void resetWorld(uint64_t startUs = 1000000ULL, uint16_t backendCaps = 0) 
   netReset();
   flakyA = false;
   flakyReads = 0;
+  precheckEvents = 0;
+  pullSource = -1;
+  tickMs = millis();
   senseCount = 0;
   highDriveEvents = 0;
   attemptCount = 0;
@@ -2420,7 +2475,7 @@ static void testEmptySocketScan() {
   CHECK(probeStatus().hardwareRequiredMask == 0);
   CHECK(allProbesPlainInput());
 
-  // Latency is dominated by per-mapping stabilization (~1.47 s each, 24).
+  // Latency is dominated by per-mapping stabilization (~1.56 s each, 24).
   const uint64_t scanMs = (mock::nowUs - t0) / 1000;
   CHECK(scanMs >= PROBE_PERMUTATION_COUNT * DHT_POWER_STABILIZE_MS &&
         scanMs <= PROBE_PERMUTATION_COUNT * 1600);
@@ -2622,7 +2677,7 @@ static void testCaptureErrors() {
 }
 
 // Coupling routes instead of latching a fault; powered drive never crosses
-// a coupled path; noise is retried, then "unknown".
+// a coupled path; noise is retried, then that attempt alone is "unknown".
 static void testPrecheckRouting() {
   resetWithDht();
   connect(0, 1, 1.0);  // simulated A-B short
@@ -2636,14 +2691,27 @@ static void testPrecheckRouting() {
   CHECK(!probeRequestRetry());  // nothing latched
   CHECK(allProbesPlainInput());
 
-  // Inconsistent readings: bounded retries, then unknown with nothing powered.
+  // Readings that never settle: each attempt gets one pass plus
+  // PRECHECK_MAX_RETRIES retries, then is skipped unpowered; the last skip
+  // ends the cycle the normal way, in bounded time.
   resetWithDht();
   flakyA = true;
-  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 2000));
+  const uint32_t passMs = PRECHECK_SETTLE_MS + PRECHECK_SAMPLE_INTERVAL_MS;  // differs at its 2nd set
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; },
+                 PROBE_PERMUTATION_COUNT * (1 + PRECHECK_MAX_RETRIES) * passMs + 10));
   CHECK(probeStatus().precheck == PrecheckResult::InconsistentReadings);
   CHECK(same(probeStatus().lastError, "precheck-inconsistent"));
-  CHECK(flakyReads == 2 * (1 + PRECHECK_MAX_RETRIES));  // inconsistency seen on sample 2 of each pass
-  CHECK(collectSessions().count == 0);
+  CHECK(flakyReads == PROBE_PERMUTATION_COUNT * 2 * (1 + PRECHECK_MAX_RETRIES));
+  CHECK(probeStatus().inconclusiveCount == PROBE_PERMUTATION_COUNT);
+  CHECK(probeStatus().inconclusiveAttempt == PROBE_PERMUTATION_COUNT);
+  CHECK(collectSessions().count == 0 && highDriveEvents == 0 && allProbesPlainInput());
+  CHECK(precheckPacingViolations() == 0);
+  // The rescan interval is kept, then a fresh cycle starts from attempt 1.
+  flakyA = false;
+  runMs(PROBE_RESCAN_INTERVAL_MS - 50);
+  CHECK(phase() == ProbePhase::NoComponent);
+  runMs(100);
+  CHECK(phase() == ProbePhase::Scanning && probeStatus().scanIndex == 1 && probeStatus().inconclusiveCount == 0);
 
   // Coupling that appears during a retry of the saved DHT mapping blocks
   // power on that mapping (VCC on B, coupled to A); it is never powered again.
@@ -2657,6 +2725,81 @@ static void testPrecheckRouting() {
   CHECK(collectSessions().count == sessionsAtFailure);
   CHECK(!probeStatus().hasMapping && probeStatus().componentName == nullptr);
   CHECK(allProbesPlainInput());
+}
+
+// A candidate whose precheck never settles is skipped unpowered, exactly
+// once; the next one starts with fresh observations and retry budget, rides
+// out a transient that settles on a retry, and is found. Clearing
+// mid-retry, the VCC-GND veto and a saved candidate's retries are unchanged.
+static void testPrecheckInconsistentSkip() {
+  const int perAttempt = 2 * (1 + PRECHECK_MAX_RETRIES);  // flaky reads: 2 per pass
+  FakeDriver a(1, "Fake A");
+  a.acceptSlot = 1;
+  useDrivers(&a);
+  resetWorld();
+  flakyA = true;
+  connect(0, 1, 1.0);  // seen coupled by the skipped attempt only
+  CHECK(runUntil([] { return probeStatus().scanIndex == 2; }, 1000));
+  CHECK(flakyReads == perAttempt && phase() == ProbePhase::Scanning);
+  CHECK(probeStatus().inconclusiveCount == 1 && probeStatus().inconclusiveAttempt == 1);
+  CHECK(probeStatus().precheck == PrecheckResult::InconsistentReadings);
+  CHECK(same(probeStatus().lastError, "precheck-inconsistent"));
+  CHECK(a.calls == 0 && highDriveEvents == 0);  // never powered or probed
+  const PrecheckEvent &fresh = precheckLog[precheckEvents - 1];
+  CHECK(fresh.kind == 'P' && fresh.source == 0);  // attempt 2: a new pass from node A
+  netReset();                                     // the short is gone
+  CHECK(runUntil([&] { return flakyReads == perAttempt + 2; }, 100));  // one inconsistent pass,
+  flakyA = false;                                                     // then the retry settles
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 2000));
+  CHECK(sameRoles(probeStatus().mapping, PROBE_PERMUTATIONS[1]) && a.probeStarts == 1 && attempts[0].slot == 1);
+  CHECK(probeStatus().inconclusiveCount == 1);  // a fresh retry budget: not skipped
+  CHECK(probeStatus().precheck == PrecheckResult::NoObviousCoupling && probeStatus().coupledPairs == 0);
+  const SessionLog log = collectSessions();
+  CHECK(log.violations == 0 && log.count == 1 && sessionPowers(log.s[0], PROBE_PERMUTATIONS[1]));
+  CHECK(precheckPacingViolations() == 0);
+
+  // Clearing mid-retry restarts discovery with a fresh budget: two more
+  // inconsistent passes after it still leave attempt 1 its third.
+  FakeDriver b(2, "Fake B");
+  b.acceptSlot = 0;
+  useDrivers(&b);
+  resetWorld();
+  flakyA = true;
+  CHECK(runUntil([] { return flakyReads == 2; }, 100));  // the first retry is running
+  CHECK(probeRequestClear() && probeStatus().scanIndex == 1);
+  CHECK(runUntil([] { return flakyReads == 2 + 4; }, 200));
+  flakyA = false;
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 2000));
+  CHECK(probeStatus().inconclusiveCount == 0 && b.probeStarts == 1 && attempts[0].slot == 0);
+
+  // A skip changes no veto: attempt 2 (C VCC, A GND) on an A-C short is
+  // still blocked as VCC-GND coupling, unpowered.
+  FakeDriver c(3, "Fake C");
+  useDrivers(&c);
+  resetWorld();
+  flakyA = true;
+  CHECK(runUntil([] { return probeStatus().scanIndex == 2; }, 1000));
+  flakyA = false;
+  connect(0, 2, 1.0);
+  CHECK(runUntil([] { return probeStatus().evaluation.serial != 0; }, 1000));
+  CHECK(sameRoles(probeStatus().evaluation.mapping, PROBE_PERMUTATIONS[1]));
+  CHECK(same(probeStatus().evaluation.reason, "VCC-GND coupling") && c.calls == 0 && highDriveEvents == 0);
+
+  // A saved candidate keeps its path: an inconsistent retry precheck is a
+  // failed acquisition (unpowered), never a discovery skip.
+  FakeDriver saved(4, "Fake S");
+  saved.acceptSlot = 0;
+  useDrivers(&saved);
+  resetWorld();
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 3000));
+  const int sessions = collectSessions().count;
+  saved.samplesSucceed = false;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 2000));
+  flakyA = true;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 2; }, 3000));
+  CHECK(same(probeStatus().lastError, "precheck-inconsistent") && probeStatus().inconclusiveCount == 0);
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 3000));
+  CHECK(collectSessions().count == sessions && !probeStatus().hasMapping && allProbesPlainInput());
 }
 
 static void testRollover() {
@@ -3820,6 +3963,50 @@ static void testMeasurementUnavailable() {
   CHECK(!probeStatus().measurementUnavailable);
 }
 
+// Precheck pacing: per source node the pulls are applied once, the first
+// set waits PRECHECK_SETTLE_MS, each next one PRECHECK_SAMPLE_INTERVAL_MS,
+// PRECHECK_SAMPLES sets in all; a stalled loop takes one set, never a
+// burst; the same across millis() rollover. A last candidate skipped as
+// inconclusive ends the cycle the normal way.
+static void testPrecheckPacing() {
+  const int perSource = 1 + PRECHECK_SAMPLES;  // its pull change, then its sets
+  FakeDriver t(1, "Fake T", ProbeTopology::TwoTerminal, ExcitationPolicy::WeakPullOnly);
+  useDrivers(&t);
+  resetWorld();
+  CHECK(runUntil([&] { return precheckEvents == perSource + 3; }, 1000));  // B's second set
+  mock::nowUs += 100000;  // the loop stalls for 100 ms
+  tick();
+  CHECK(precheckEvents == perSource + 4);  // one set, not a burst
+  runMs(PRECHECK_SAMPLE_INTERVAL_MS - 1);
+  CHECK(precheckEvents == perSource + 4);  // the interval counts from it
+  CHECK(runUntil([&] { return t.probeStarts == 1; }, 1000));
+  CHECK(precheckEvents == PROBE_NODE_COUNT * perSource);  // one consistent pass
+  for (int i = 0; i < precheckEvents; i++) {
+    CHECK(precheckLog[i].kind == (i % perSource == 0 ? 'P' : 'S') && precheckLog[i].source == i / perSource);
+  }
+  CHECK(precheckPacingViolations() == 0);
+
+  // millis() wraps during node B's sets.
+  FakeDriver w(2, "Fake W", ProbeTopology::TwoTerminal, ExcitationPolicy::WeakPullOnly);
+  useDrivers(&w);
+  resetWorld((static_cast<uint64_t>(0xFFFFFFFFu) - 60) * 1000);
+  CHECK(runUntil([&] { return w.probeStarts == 1; }, 1000));
+  CHECK(millis() < 1000);  // the counter really wrapped
+  CHECK(precheckEvents == PROBE_NODE_COUNT * perSource && precheckPacingViolations() == 0);
+
+  // Only the last candidate never settles: skipped, then the normal end of
+  // the cycle.
+  FakeDriver last(3, "Fake L", ProbeTopology::TwoTerminal, ExcitationPolicy::WeakPullOnly);
+  useDrivers(&last);
+  resetWorld();
+  CHECK(runUntil([] { return probeStatus().scanIndex == PROBE_PAIR_COUNT; }, 5000));
+  flakyA = true;
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 1000));
+  CHECK(probeStatus().inconclusiveCount == 1 && probeStatus().inconclusiveAttempt == PROBE_PAIR_COUNT);
+  CHECK(last.probeStarts == PROBE_PAIR_COUNT - 1 && allProbesPlainInput());
+  CHECK(same(probeStatus().lastError, "precheck-inconsistent") && !probeStatus().measurementUnavailable);
+}
+
 #endif  // PINDEX_PASSIVE_PROBING_ENABLED
 
 #if PASSIVE_ONLY_BUILD
@@ -3908,6 +4095,7 @@ int main() {
   testRemovalAfterThreeFailures();
   testCaptureErrors();
   testPrecheckRouting();
+  testPrecheckInconsistentSkip();
   testRollover();
   testPermutationMajorDriverOrder();
   testLaterDriverAndConfirmation();
@@ -3950,6 +4138,7 @@ int main() {
   testVariableAndGuidedLdr();
   testResistiveOpenGrace();
   testMeasurementUnavailable();
+  testPrecheckPacing();
 #endif
 #if PASSIVE_ONLY_BUILD
   testPassiveOnlyBuild();

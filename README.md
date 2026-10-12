@@ -210,9 +210,15 @@ shorts nodes to discharge them.
 ## Precheck routing (diagnostic heuristic only)
 
 Before every attempt, each of the four nodes in turn is set to
-`INPUT_PULLUP` while the other three are `INPUT_PULLDOWN`. After a short
-settle time, all four nodes are sampled four times, then everything
-returns to plain `INPUT` (and the four-wire backend is off). This covers
+`INPUT_PULLUP` while the other three are `INPUT_PULLDOWN`. The pulls are
+applied once per node; after `PRECHECK_SETTLE_MS` (20 ms) all four nodes
+are sampled, then three more times `PRECHECK_SAMPLE_INTERVAL_MS` (5 ms)
+apart, at most one sample per loop pass (about 140 ms for the whole
+precheck). Then everything returns to plain `INPUT` (and the four-wire
+backend is off). Both waits are provisional and not yet validated on
+hardware. They give charge left by the previous attempt (e.g. a breakout's
+capacitors) time to bleed through the pulls, but no wait proves a
+capacitor has discharged. This covers
 all six pairs: A–B, A–C, A–D, B–C, B–D, C–D (`coupled=` in the Serial log
 lists them).
 
@@ -225,7 +231,7 @@ instead of latching a fault:
 |---|---|---|---|
 | No pulled-down node read HIGH (`NoObviousCoupling`) | Runs | Runs (behind the protected interface) | Runs **only** with an eligible supply profile; the precheck grants nothing |
 | A pulled-down node read HIGH: that pair is coupled (`CouplingObserved`) | Runs; the ADC tells contact from resistance | **Blocked across that path**: a mapping is skipped if its VCC node is coupled to any other node | I2C: as three-wire, except the measured [pull-up exception](#narrow-open-drain-pull-up-exception). Ultrasonic: **every mapping blocked** (see below) |
-| Readings changed between samples (`InconsistentReadings`) | Retried up to `PRECHECK_MAX_RETRIES` times, then **unknown**: nothing runs this cycle | Same: no safety is inferred | Same |
+| Readings changed between samples (`InconsistentReadings`) | One pass plus up to `PRECHECK_MAX_RETRIES` (2) retries, then **unknown**: only that attempt is skipped (never run), and discovery continues with the next one | Same: that mapping is never powered | Same |
 | ADC or configuration failure (passive driver) | Measurement stops, pins reset, the attempt fails | No fallback permission | No fallback permission |
 
 The rule underneath: **a node the attempt drives must show no coupling to
@@ -586,9 +592,9 @@ activity).
 
 ### Latency (with an eligible supply)
 
-One empty four-wire I2C attempt takes about 0.56 s (44 ms precheck +
+One empty four-wire I2C attempt takes about 0.66 s (140 ms precheck +
 100 ms stabilization + one ~112-pass sweep + 300 ms off). A module on
-four-wire mapping *k* is confirmed about (*k* − 1) × 0.56 s + 0.4 s after
+four-wire mapping *k* is confirmed about (*k* − 1) × 0.66 s + 0.5 s after
 the three-wire attempts, and its first liveness sample (and the result
 screen) follows 2 s later. In the simulation each pass is 1 ms; on
 hardware a pass is usually faster, so sweeps are shorter.
@@ -995,14 +1001,19 @@ plus the heartbeat `heartbeat uptime=12s display=ok probe=detected`.
 
 | Event | Approximate time |
 |---|---|
-| One failed three-wire mapping (44 ms precheck + 1100 ms + start + 300 ms off) | 1.47 s |
-| Full empty-socket scan, as shipped (24 three-wire + 6 pairs) | ≈ 37.5 s, then 5 s idle |
-| First valid DHT frame at three-wire entry *k* | 1.17 s + (*k* − 1) × 1.47 s |
-| Confirmed DHT result | the above + 2.1 s (≈ 3.3 s for entry 1, ≈ 10.6 s for entry 6, ≈ 37 s for entry 24) |
-| Removal inferred after extraction | ≈ 4.3–6.5 s |
-| One failed ultrasonic mapping (with a backend: precheck + 200 ms + 25 ms deadline + 300 ms off) | ≈ 0.57 s |
-| One empty I2C mapping (with an eligible supply: precheck + 100 ms + one sweep + 300 ms off) | ≈ 0.56 s |
-| Extra scan time per four-wire driver with an eligible supply | ≈ 13.5–13.7 s for all 24 |
+| One failed three-wire mapping (140 ms precheck + 1100 ms + start + 300 ms off) | 1.56 s |
+| Full empty-socket scan, as shipped (24 three-wire + 6 pairs) | ≈ 40 s, then 5 s idle |
+| First valid DHT frame at three-wire entry *k* | 1.26 s + (*k* − 1) × 1.56 s |
+| Confirmed DHT result | the above + 2.1 s (≈ 3.4 s for entry 1, ≈ 11.2 s for entry 6, ≈ 39 s for entry 24) |
+| Removal inferred after extraction | ≈ 4.5–6.6 s |
+| One failed ultrasonic mapping (with a backend: precheck + 200 ms + 25 ms deadline + 300 ms off) | ≈ 0.67 s |
+| One empty I2C mapping (with an eligible supply: precheck + 100 ms + one sweep + 300 ms off) | ≈ 0.66 s |
+| Extra scan time per four-wire driver with an eligible supply | ≈ 15.8–16.0 s for all 24 |
+
+**Precheck pacing cost:** the 20 ms / 5 ms precheck waits (previously
+5 ms / 2 ms) add about 0.1 s to every attempt, ≈ 5 s over a 54-attempt
+cycle. An attempt skipped as inconclusive takes about 75 ms (three
+passes, each stopped at its first changed sample).
 
 **Phase 4 latency cost:** the D node quadruples the three-wire mappings
 (6 → 24), so an empty-socket cycle grew from about 8.4 s to about 37.5 s.
@@ -1010,9 +1021,9 @@ The per-mapping 1100 ms DHT stabilization dominates. Each extra registered
 driver adds its own attempt (precheck, stabilization, operation,
 power-off) to every mapping of its topology.
 
-The passive pairs add about 2.3 s per cycle: six pairs of about 0.38 s
+The passive pairs add about 2.9 s per cycle: six pairs of about 0.48 s
 each (precheck, two measurement windows, 300 ms off). A passive result is
-confirmed about 0.5 s after its cycle ends. Passive monitoring samples
+confirmed about 0.6 s after its cycle ends. Passive monitoring samples
 every 100 ms, so switch transitions show within about 0.2–0.3 s.
 
 **Blocking:** all millisecond waits are cooperative. These calls block
@@ -1324,6 +1335,17 @@ The simulator can weaken its pull-downs (`net.pulldownOhms`) so the
 digital precheck flags a pull-up network. With equal 45 kΩ pulls it reads
 LOW, so whether real hardware flags one is itself unverified.
 
+Precheck pacing and inconclusive skips: no sample before the settle time,
+four sets per pull configuration at the sample interval, one set (never
+a burst) after a stalled loop, pacing across a `millis()` rollover, one
+pass plus exactly `PRECHECK_MAX_RETRIES` retries, a transient that
+settles on a retry, a skipped candidate that is never powered followed
+by a later one that is found with fresh observations and retry budget,
+every candidate skipped in bounded time, a skipped last candidate ending
+the cycle normally, clearing mid-retry, the VCC-GND veto after a skip,
+and a saved candidate's inconsistent retry counting as a failed
+acquisition.
+
 Coverage added in Phase 5 includes: I2C role text on all 24 mappings,
 the supply profiles (3.3 V vs 5 V backend, partial capabilities, the GPIO
 profile off and on, the powered setting overriding it), the precheck
@@ -1580,8 +1602,17 @@ sources.
 - **Ultrasonic `err=no-echo` / `echo-timeout` (with a backend):** no
   target in range, a soft or angled target, or the module was removed.
   These cannot be told apart.
-- **`err=precheck-inconsistent`:** the precheck readings kept changing, so
-  nothing was attempted. Check for loose contacts.
+- **`err=precheck-inconsistent`:** the precheck readings of one attempt
+  kept changing through all three passes, so that attempt was skipped
+  without power, logged as
+  `precheck: attempt 9/54 inconsistent; retries exhausted; skipping`, and
+  discovery went on with the next attempt. The status line counts the
+  skips (`inconclusive=1/54`); a skipped attempt was never tested, so a
+  final *No Component / Unknown* with skips is not proof that the socket
+  is empty. Causes: loose contacts, or charge still decaying from the
+  previous powered attempt (a breakout's capacitors). If the skips always
+  land on the same attempts, the settle times in `config.h` may need
+  tuning on that hardware.
 - **`err=ambiguous-pairs`:** more than one of the six pairs conducts (a
   three-terminal part or a network). This is not supported as a passive
   result.

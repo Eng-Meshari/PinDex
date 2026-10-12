@@ -80,11 +80,15 @@
 
 // Weak-pull precheck (diagnostic heuristic, not a safety test). It routes:
 // a pulled-down node reading HIGH marks that pair as coupled, which blocks
-// powered drive across it; inconsistent readings are retried, then "unknown".
-#define PRECHECK_SETTLE_MS 5UL           // after changing pulls, before sample 1
-#define PRECHECK_SAMPLE_INTERVAL_MS 2UL  // between samples
+// powered drive across it. Readings that change within a pass are retried;
+// if they never settle, only that attempt is skipped (never powered) and
+// discovery goes on. The waits let charge left by the previous attempt
+// (e.g. a breakout's capacitors) bleed through the pulls. Provisional
+// values, NOT validated on hardware; no wait proves a capacitor discharged.
+#define PRECHECK_SETTLE_MS 20UL          // after each pull change, before sample 1
+#define PRECHECK_SAMPLE_INTERVAL_MS 5UL  // between samples under one pull configuration
 #define PRECHECK_SAMPLES 4               // per pull-up source node
-#define PRECHECK_MAX_RETRIES 2           // extra passes after inconsistent readings
+#define PRECHECK_MAX_RETRIES 2           // extra passes after inconsistent readings (1 + 2 passes)
 
 // Narrow open-drain pull-up exception (probe_engine.cpp). Only for a
 // FourWirePowered + Supply3V3 + open-drain candidate (the I2C scanner)

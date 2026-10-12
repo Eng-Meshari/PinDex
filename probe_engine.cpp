@@ -29,7 +29,8 @@
 // finite resistance; the digital test cannot tell which) never authorises
 // powered drive across it; it is measured by weak-pull (passive) drivers
 // instead. Seeing no coupling never authorises anything either.
-// Inconsistent readings are retried, then treated as "unknown". The one
+// Inconsistent readings are retried, then that attempt alone is skipped as
+// "unknown" (never powered) and discovery continues. The one
 // narrow exception (decideCoupling()): an open-drain Supply3V3 four-wire
 // candidate whose VCC is coupled only to its signals, where weak-pull ADC
 // measurements in this observation cycle show a supported pull-up network.
@@ -580,24 +581,31 @@ void beginPrecheck(uint32_t now) {
 }
 
 void onAttemptFailed(uint32_t now, const char *reason);
+void onAttemptBlocked(uint32_t now, const char *reason);
 
+// Still inconsistent after every retry: unknown, so this attempt is never
+// powered. Pulls off first (every node plain INPUT). A saved mapping counts
+// a failed acquisition as before; discovery skips only this candidate, and
+// the next one starts its own fresh precheck (nothing observed here is
+// reused).
 void onPrecheckInconclusive(uint32_t now) {
   resetTestPins();
   status.precheck = PrecheckResult::InconsistentReadings;
   status.coupledPairs = 0;
-  if (savedDriver != nullptr) {
-    onAttemptFailed(now, "precheck-inconsistent");
-    return;
-  }
-  // Ambiguous/noisy: no safety is inferred and nothing runs this cycle.
-  noComponent = true;
   status.lastError = "precheck-inconsistent";
-  goIdle(now, PROBE_RESCAN_INTERVAL_MS);
+  if (savedDriver == nullptr) {
+    status.inconclusiveCount++;
+    status.inconclusiveAttempt = static_cast<uint16_t>(attemptIndex + 1);
+  }
+  onAttemptBlocked(now, "precheck-inconsistent");
 }
 
 // Internal pulls are ~45 kOhm, so these readings are only a coarse hint: a
 // pulled-down node reading HIGH marks that pair as coupled (contact or
 // finite R alike). LOW readings do not prove there is no short.
+// At most one sample set per call, each PRECHECK_SETTLE_MS after the pull
+// change or PRECHECK_SAMPLE_INTERVAL_MS after the previous set, so a
+// stalled loop never takes catch-up samples.
 void tickPrecheck(uint32_t now) {
   const uint32_t wait = precheckSample == 0 ? PRECHECK_SETTLE_MS : PRECHECK_SAMPLE_INTERVAL_MS;
   if (!elapsed(now, stateSinceMs, wait)) return;
@@ -615,8 +623,11 @@ void tickPrecheck(uint32_t now) {
   }
 
   if (inconsistent) {
-    if (precheckRetries++ < PRECHECK_MAX_RETRIES) {
-      startPrecheckPass(now);  // bounded diagnostic retry
+    // One initial pass plus at most PRECHECK_MAX_RETRIES retries, each a
+    // whole new pass from the first source node.
+    if (precheckRetries < PRECHECK_MAX_RETRIES) {
+      precheckRetries++;
+      startPrecheckPass(now);
     } else {
       onPrecheckInconclusive(now);
     }
@@ -626,7 +637,7 @@ void tickPrecheck(uint32_t now) {
   if (++precheckSample < PRECHECK_SAMPLES) return;
   if (++precheckSource < PROBE_NODE_COUNT) {
     precheckSample = 0;
-    applyPrecheckPulls(precheckSource);
+    applyPrecheckPulls(precheckSource);  // settles from `now` (stateSinceMs above)
     return;
   }
   resetTestPins();  // all nodes plain INPUT before any excitation
@@ -715,6 +726,8 @@ void startDiscovery(uint32_t now) {
   twoTerminalHits = 0;
   cycleMeasurementError = false;
   status.measurementUnavailable = false;
+  status.inconclusiveCount = 0;
+  status.inconclusiveAttempt = 0;
   status.hardwareRequiredMask = hardwareRequiredMask();  // skipped, never a scan fault
   if (attemptTotal() == 0) {  // nothing to try: never precheck or excite
     noComponent = true;
@@ -757,7 +770,8 @@ void advanceAttempt(uint32_t now, bool energised) {
 }
 
 // The attempt is not permitted (coupled driven path, missing backend
-// capability, disabled topology); nothing was energised.
+// capability, disabled topology, inconclusive precheck); nothing was
+// energised.
 void onAttemptBlocked(uint32_t now, const char *reason) {
   if (savedDriver != nullptr) {
     onAttemptFailed(now, reason);  // never powered across it

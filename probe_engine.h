@@ -72,7 +72,8 @@ enum class PrecheckResult : uint8_t {
                          // drive across it (except the measured open-drain
                          // pull-up exception, decideCoupling()); passive
                          // measurement may proceed
-  InconsistentReadings,  // still noisy after PRECHECK_MAX_RETRIES: unknown
+  InconsistentReadings,  // still noisy after PRECHECK_MAX_RETRIES: unknown, that
+                         // attempt is skipped unpowered
 };
 
 // Derived evidence for one physical pair, from a weak-pull ADC measurement
@@ -163,6 +164,9 @@ struct ProbeStatus {
   const char *lastError;         // latest failure reason, nullptr after a success
   PrecheckResult precheck;       // latest completed precheck
   uint8_t coupledPairs;          // pairs the latest precheck saw coupled
+  uint16_t inconclusiveCount;    // attempts of this discovery cycle skipped as inconclusive
+                                 // (precheck never settled): never powered or tested
+  uint16_t inconclusiveAttempt;  // 1-based attempt number of the latest skip, 0 = none
   bool measurementUnavailable;   // last cycle failed on measurement errors (e.g. ADC)
   uint8_t hardwareRequiredMask;  // bit i: registered driver i is enabled but has no eligible
                                  // supply (no capable backend, profile off); it is skipped
