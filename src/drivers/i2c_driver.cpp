@@ -50,6 +50,7 @@ const DriverRequirements kRequirements = {
     SupplyProfile::Supply3V3,           // 3.3 V backend; else only the experimental GPIO profile
     true,                               // openDrainSignals: SDA/SCL are only released or sunk
     {"SDA", "SCL"},                     // signalLabel: SIG1, SIG2
+    false,                              // dataIsOutput: three-wire only
 };
 
 struct Hint {

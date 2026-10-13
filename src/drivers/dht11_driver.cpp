@@ -23,6 +23,7 @@ const DriverRequirements kRequirements = {
     SupplyProfile::GpioLogic,   // supply: VCC/GND from GPIOs
     true,                       // openDrainSignals: DATA is only pulled up or sunk
     {nullptr, nullptr},         // signalLabel: three-wire roles are VCC/DAT/GND
+    false,                      // dataIsOutput: the host sinks DATA (start pulse)
 };
 
 // ---- Bounded DHT response capture ----------------------------------------

@@ -56,6 +56,7 @@ const DriverRequirements kRequirements = {
     SupplyProfile::Backend5V,           // backend 5 V only, never GPIOs
     false,                              // openDrainSignals: TRIG is push-pull
     {"TRG", "ECH"},                     // signalLabel: SIG1, SIG2
+    false,                              // dataIsOutput: three-wire only
 };
 
 // Guards edge_/riseUs_/fallUs_ between the ISR and the driver. Held only

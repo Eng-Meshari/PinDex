@@ -48,6 +48,25 @@ void drawStatusScreen(const char *line1, const char *line2) {
   oled.display();
 }
 
+// Status-bar text of a live result: the evidence behind it, so a tentative
+// mapping is never shown as a plain LIVE result. At most 21 glyphs
+// ("LIVE UNVERIFIED 24/24").
+static_assert(PROBE_MAX_CANDIDATES < 100, "the candidate counter is two digits");
+const char *liveText(const ProbeStatus &s, char *buf, size_t len) {
+  switch (s.evidence) {
+    case EvidenceLevel::Candidate:
+      if (s.candidateCount <= 1) return "LIVE UNVERIFIED";
+      snprintf(buf, len, "LIVE UNVERIFIED %u/%u", (unsigned)s.candidateSelected, (unsigned)s.candidateCount);
+      return buf;
+    case EvidenceLevel::UserVerified:
+      return "LIVE USER VERIFIED";
+    case EvidenceLevel::None:
+    case EvidenceLevel::Validated:
+      break;
+  }
+  return "LIVE";
+}
+
 // Pixel width of `text` at size 1, as the font will draw it.
 uint16_t textWidth(const char *text) {
   int16_t x1, y1;
@@ -103,7 +122,7 @@ void drawResultScreen(const ProbeStatus &s) {
     drawCentered(line, 1, 54);  // rows 54-61
     oled.setTextColor(SSD1306_WHITE);
   } else {
-    drawCentered("LIVE", 1, 54);
+    drawCentered(liveText(s, line, sizeof line), 1, 54);
   }
   oled.display();
 }
@@ -160,7 +179,10 @@ void showProbeStatus(const ProbeStatus &s) {
                        "Confirming...");
       break;
     case ProbePhase::NoComponent:
-      if (s.measurementUnavailable) {
+      if (s.candidateCount > 1) {  // ambiguous: no pinout is picked for the user
+        snprintf(line, sizeof line, "%u possible pinouts", (unsigned)s.candidateCount);
+        drawStatusScreen(line, "Send 'n' to select");
+      } else if (s.measurementUnavailable) {
         drawStatusScreen("Measurement", "unavailable");
       } else {
         drawStatusScreen("No Component /", "Unknown");

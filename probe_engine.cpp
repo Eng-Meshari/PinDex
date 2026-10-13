@@ -38,6 +38,15 @@
 // The engine owns pins, power, prechecks, scheduling, confirmation and
 // removal. Drivers (sensor_driver.h) are chosen by capabilities only; this
 // file knows no concrete driver.
+//
+// Evidence: a success whose driver reports EvidenceLevel::Candidate (e.g. a
+// stable digital level) never stops discovery. Its attempt is torn down and
+// remembered; the cycle runs on, and any Validated success (DHT frame,
+// echoes, I2C ACKs) supersedes every candidate. At the end of a cycle a
+// single passive pair still wins; otherwise one candidate is re-probed and
+// shown as tentative, and several are reported as ambiguous and held for
+// the user to pick one (probeSelectCandidate()) or clear. A pick goes
+// through the same power-off wait, precheck and vetoes as any attempt.
 
 static_assert(PROBE_RETRY_COOLDOWN_MS >= PROBE_POWER_OFF_MS,
               "a retry must include the power-off interval");
@@ -52,6 +61,7 @@ static_assert(PROBE_PERMUTATION_COUNT == 4 * 3 * 2, "three-wire: ordered triples
 static_assert(PROBE_FOUR_WIRE_COUNT == 4 * 3 * 2 * 1, "four-wire: orderings of 4 nodes");
 static_assert(PROBE_PAIR_COUNT == 4 * 3 / 2, "two-terminal: unordered pairs of 4 nodes");
 static_assert(PROBE_PAIR_COUNT <= 8, "ProbeStatus::coupledPairs is an 8-bit pair mask");
+static_assert(PROBE_MAX_CANDIDATES <= 255, "ProbeStatus::candidateCount is 8-bit");
 
 const uint8_t PROBE_NODE_GPIO[] = {PROBE_PIN_A, PROBE_PIN_B, PROBE_PIN_C, PROBE_PIN_D};
 const char PROBE_NODE_LABEL[] = {'A', 'B', 'C', 'D'};
@@ -183,6 +193,11 @@ uint8_t precheckCoupled = 0;
 uint8_t precheckFirst[PROBE_NODE_COUNT];
 uint8_t twoTerminalHits = 0;     // pairs that behaved as a two-terminal part
 size_t twoTerminalHitIndex = 0;
+// Attempt indices of this cycle's Candidate successes (status.candidateCount
+// of them). ponytail: only the three-wire binary driver reports Candidate,
+// so 24 slots suffice; a later one is dropped (the cycle is ambiguous anyway).
+uint16_t candidateAttempt[PROBE_MAX_CANDIDATES];
+bool awaitingSelection = false;  // several candidates: no rescan until a pick or a clear
 bool cycleMeasurementError = false;
 ProbeStatus status;
 
@@ -350,10 +365,24 @@ bool attemptAt(size_t index, Attempt &out) {
   return false;
 }
 
+// The tables use Data; a driver whose DATA is the module's output gets Out
+// there instead: no engine pull-up, released at teardown, shown as OUT.
+ProbeMapping rolesFor(const DriverRequirements &r, ProbeMapping m) {
+  if (r.dataIsOutput && m.topology == ProbeTopology::ThreeWirePowered) {
+    for (NodeRole &role : m.role) {
+      if (role == NodeRole::Data) role = NodeRole::Out;
+    }
+  }
+  return m;
+}
+
 const ProbeMapping *currentMapping() {
   if (status.hasMapping) return &status.mapping;
+  static ProbeMapping attempt;  // the table entry with its driver's roles
   Attempt a;
-  return attemptAt(attemptIndex, a) ? a.mapping : nullptr;
+  if (!attemptAt(attemptIndex, a)) return nullptr;
+  attempt = rolesFor(a.driver->getRequirements(), *a.mapping);
+  return &attempt;
 }
 
 // The driver being attempted (discovery) or the saved candidate/active one.
@@ -419,10 +448,12 @@ ProbeContext contextFor(const ProbeMapping &m) {
   ProbeContext c{};
   c.topology = m.topology;
   switch (m.topology) {
-    case ProbeTopology::ThreeWirePowered:
-      c.powered = {gpioWithRole(m, NodeRole::Vcc), gpioWithRole(m, NodeRole::Data),
+    case ProbeTopology::ThreeWirePowered: {
+      const uint8_t data = gpioWithRole(m, NodeRole::Data);
+      c.powered = {gpioWithRole(m, NodeRole::Vcc), data != kNoPin ? data : gpioWithRole(m, NodeRole::Out),
                    gpioWithRole(m, NodeRole::Gnd)};
       break;
+    }
     case ProbeTopology::FourWirePowered:
       c.fourWire = {gpioWithRole(m, NodeRole::Vcc), gpioWithRole(m, NodeRole::Sig1),
                     gpioWithRole(m, NodeRole::Sig2), gpioWithRole(m, NodeRole::Gnd)};
@@ -451,8 +482,8 @@ void driveNode(uint8_t node, uint8_t level) {
 // GPIO power (three-wire, and the experimental four-wire I2C profile):
 // every node plain INPUT and the backend off first (break), then GND LOW so
 // VCC never rises without a return, then VCC HIGH, each latch written
-// before its output turns on. Three-wire DATA gets the pull-up; four-wire
-// signals and every unused node stay plain INPUT.
+// before its output turns on. Three-wire DATA gets the pull-up; OUT,
+// four-wire signals and every unused node stay plain INPUT.
 void powerUpFromGpio(const ProbeMapping &m) {
   resetTestPins();
   const int vcc = probeNodeWithRole(m, NodeRole::Vcc);
@@ -464,15 +495,17 @@ void powerUpFromGpio(const ProbeMapping &m) {
   if (data >= 0) pinMode(gpio(static_cast<uint8_t>(data)), INPUT_PULLUP);
 }
 
-// Signals first (DATA/SIG1/SIG2: no pull-up or drive left to back-power the
-// part), then VCC, then every node including GND to plain INPUT;
+// Signals first (DATA/OUT/SIG1/SIG2: no pull-up or drive left to back-power
+// the part), then VCC, then every node including GND to plain INPUT;
 // resetTestPins() then switches the four-wire backend off. The driver has
 // already released its own lines and peripherals (releaseAttempt()).
 void teardown(const ProbeMapping *m) {
   if (m != nullptr) {
     for (uint8_t n = 0; n < PROBE_NODE_COUNT; n++) {
       const NodeRole role = m->role[n];
-      if (role == NodeRole::Data || role == NodeRole::Sig1 || role == NodeRole::Sig2) pinMode(gpio(n), INPUT);
+      if (role == NodeRole::Data || role == NodeRole::Out || role == NodeRole::Sig1 || role == NodeRole::Sig2) {
+        pinMode(gpio(n), INPUT);
+      }
     }
     const int vcc = probeNodeWithRole(*m, NodeRole::Vcc);
     if (vcc >= 0) pinMode(gpio(static_cast<uint8_t>(vcc)), INPUT);
@@ -523,20 +556,28 @@ void clearResult() {
   status.mapping = ProbeMapping{};
   status.signalLabel[0] = status.signalLabel[1] = nullptr;
   status.componentName = nullptr;
+  status.evidence = EvidenceLevel::None;
   status.detected = false;
   status.readingValid = false;
   status.readingStale = false;
   status.telemetry1[0] = '\0';
   status.telemetry2[0] = '\0';
   status.consecutiveFailures = 0;
+  status.candidateSelected = 0;
   confirmations = 0;
+}
+
+void clearCandidates() {
+  status.candidateCount = 0;
+  status.candidateSelected = 0;
+  awaitingSelection = false;
 }
 
 // Keeps `driver` on `m` as the candidate; confirmation starts from zero.
 void saveCandidate(SensorDriver *driver, const ProbeMapping &m) {
   const DriverRequirements &r = driver->getRequirements();
   savedDriver = driver;
-  status.mapping = m;
+  status.mapping = rolesFor(r, m);
   status.hasMapping = true;
   status.signalLabel[0] = r.signalLabel[0];
   status.signalLabel[1] = r.signalLabel[1];
@@ -721,6 +762,7 @@ void recordEvaluation(const SensorDriver *driver, const ProbeMapping &m, const C
 
 void startDiscovery(uint32_t now) {
   clearResult();
+  clearCandidates();
   noComponent = false;
   attemptIndex = 0;
   twoTerminalHits = 0;
@@ -737,20 +779,44 @@ void startDiscovery(uint32_t now) {
   beginPrecheck(now);
 }
 
+// Makes tentative candidate `index` the saved candidate. Like any saved
+// mapping it is powered only after the power-off wait, a fresh precheck and
+// the vetoes, and re-probed before anything is shown.
+bool selectCandidate(uint8_t index, uint32_t now) {
+  Attempt a;
+  if (index >= status.candidateCount || !attemptAt(candidateAttempt[index], a)) return false;
+  clearResult();
+  saveCandidate(a.driver, *a.mapping);
+  status.componentName = a.driver->getName();
+  status.candidateSelected = static_cast<uint8_t>(index + 1);
+  awaitingSelection = false;
+  noComponent = false;
+  enter(State::PowerOffWait, now);
+  return true;
+}
+
 void finishCycle(uint32_t now) {
   Attempt hit;
   if (twoTerminalHits == 1 && attemptAt(twoTerminalHitIndex, hit)) {
     // Exactly one pair behaved as a two-terminal part: make it the
     // candidate and re-probe it from a fresh precheck (the scan result
-    // itself is not reused as a confirming acquisition).
+    // itself is not reused as a confirming acquisition). A stable digital
+    // level never overrides it; tentative candidates stay selectable.
     saveCandidate(hit.driver, *hit.mapping);
     status.componentName = hit.driver->getName();
     status.consecutiveFailures = 0;
     enter(State::PowerOffWait, now);
     return;
   }
+  if (status.candidateCount == 1 && selectCandidate(0, now)) return;  // shown as tentative only
   noComponent = true;
   if (twoTerminalHits > 1) status.lastError = "ambiguous-pairs";  // multi-node coupling
+  if (status.candidateCount > 1) {
+    // Indistinguishable evidence: no mapping is picked, and the list is
+    // kept (no rescan) until the user picks one or clears.
+    status.lastError = "ambiguous-mappings";
+    awaitingSelection = true;
+  }
   status.measurementUnavailable = cycleMeasurementError && twoTerminalHits == 0;
   goIdle(now, PROBE_RESCAN_INTERVAL_MS);
 }
@@ -789,12 +855,18 @@ void countConfirmation() {
 void onProbeSucceeded(SensorDriver *driver, uint32_t now) {
   status.consecutiveFailures = 0;
   status.lastError = nullptr;
-  if (savedDriver == nullptr && driver->getRequirements().topology == ProbeTopology::TwoTerminal) {
+  const bool pair = driver->getRequirements().topology == ProbeTopology::TwoTerminal;
+  if (savedDriver == nullptr && (pair || driver->evidence() == EvidenceLevel::Candidate)) {
     // Two-terminal results are judged over every pair before one is
     // published, so a conducting pair is never reported while another
-    // node is also coupled.
-    twoTerminalHits++;
-    twoTerminalHitIndex = attemptIndex;
+    // node is also coupled. Candidate evidence is judged over the whole
+    // cycle, so it never stops discovery or hides a later protocol match.
+    if (pair) {
+      twoTerminalHits++;
+      twoTerminalHitIndex = attemptIndex;
+    } else if (status.candidateCount < PROBE_MAX_CANDIDATES) {
+      candidateAttempt[status.candidateCount++] = static_cast<uint16_t>(attemptIndex);
+    }
     if (!releaseAttempt(driver, currentMapping())) {
       status.lastError = "release-failed";
       enterFault(now);
@@ -803,8 +875,12 @@ void onProbeSucceeded(SensorDriver *driver, uint32_t now) {
     advanceAttempt(now, true);
     return;
   }
-  if (savedDriver == nullptr) saveCandidate(driver, *currentMapping());  // stop scanning
+  if (savedDriver == nullptr) {
+    clearCandidates();  // a validated response supersedes every tentative one
+    saveCandidate(driver, *currentMapping());  // stop scanning
+  }
   status.componentName = driver->getName();
+  status.evidence = driver->evidence();
   countConfirmation();
   // The mapping stays prepared; telemetry arrives with the next readSample().
   enter(status.detected ? State::Monitoring : State::Confirming, now);
@@ -814,6 +890,7 @@ void onSampleSucceeded(const char *line1, const char *line2, uint32_t now) {
   snprintf(status.telemetry1, sizeof status.telemetry1, "%s", line1);
   snprintf(status.telemetry2, sizeof status.telemetry2, "%s", line2);
   status.componentName = savedDriver->getName();  // classification may evolve
+  status.evidence = savedDriver->evidence();       // e.g. a guided verification completed
   status.readingValid = true;
   status.readingStale = false;
   status.lastReadingMs = now;
@@ -894,7 +971,7 @@ void step(uint32_t now) {
       break;  // probes stay INPUT; Fault waits for probeRequestRetry()
 
     case State::Idle:
-      if (elapsed(now, stateSinceMs, idleDelayMs)) startDiscovery(now);
+      if (!awaitingSelection && elapsed(now, stateSinceMs, idleDelayMs)) startDiscovery(now);
       break;
 
     case State::Precheck:
@@ -1016,13 +1093,14 @@ bool sameForDisplay(const ProbeStatus &a, const ProbeStatus &b) {
   return a.phase == b.phase && a.scanIndex == b.scanIndex && a.scanTotal == b.scanTotal &&
          a.hasMapping == b.hasMapping && sameMapping(a.mapping, b.mapping) &&
          sameText(a.signalLabel[0], b.signalLabel[0]) && sameText(a.signalLabel[1], b.signalLabel[1]) &&
-         sameText(a.componentName, b.componentName) && a.detected == b.detected &&
+         sameText(a.componentName, b.componentName) && a.evidence == b.evidence && a.detected == b.detected &&
          a.readingValid == b.readingValid && a.readingStale == b.readingStale &&
          sameText(a.telemetry1, b.telemetry1) && sameText(a.telemetry2, b.telemetry2) &&
          a.consecutiveFailures == b.consecutiveFailures && sameText(a.lastError, b.lastError) &&
          a.precheck == b.precheck && a.coupledPairs == b.coupledPairs &&
          a.measurementUnavailable == b.measurementUnavailable &&
-         a.hardwareRequiredMask == b.hardwareRequiredMask;
+         a.hardwareRequiredMask == b.hardwareRequiredMask && a.candidateCount == b.candidateCount &&
+         a.candidateSelected == b.candidateSelected;
 }
 
 void publish(const ProbeStatus &before) {
@@ -1066,6 +1144,7 @@ void initProbeEngine() {
   confirmations = 0;
   noComponent = false;
   twoTerminalHits = 0;
+  awaitingSelection = false;
   cycleMeasurementError = false;
   status.hardwareRequiredMask = hardwareRequiredMask();
 
@@ -1111,6 +1190,30 @@ bool probeSendCommand(char command) {
   return savedDriver->handleUserCommand(command);
 }
 
+bool probeSelectCandidate() {
+  const bool discovering = savedDriver == nullptr && state != State::Idle;
+  if (state == State::Disabled || state == State::Fault || discovering || status.candidateCount == 0) {
+    return false;
+  }
+  const ProbeStatus before = status;
+  const uint32_t now = millis();
+  if (!releaseAttempt(currentDriver(), currentMapping())) {  // driver, then power and pins
+    status.lastError = "release-failed";
+    enterFault(now);
+  } else if (!selectCandidate(static_cast<uint8_t>(status.candidateSelected % status.candidateCount), now)) {
+    enterFault(now);  // the list no longer matches the attempt table: internal fault
+  }
+  publish(before);
+  return true;
+}
+
+bool probeCandidateMapping(uint8_t index, ProbeMapping &out) {
+  Attempt a;
+  if (index >= status.candidateCount || !attemptAt(candidateAttempt[index], a)) return false;
+  out = rolesFor(a.driver->getRequirements(), *a.mapping);
+  return true;
+}
+
 bool probeFormatDiagnostics(char *buf, size_t len) {
   if (buf == nullptr || len == 0) return false;
   buf[0] = '\0';
@@ -1140,6 +1243,7 @@ const char *probeRoleName(NodeRole role, const char *const *signalLabel) {
   switch (role) {
     case NodeRole::Vcc: return "VCC";
     case NodeRole::Data: return "DAT";
+    case NodeRole::Out: return "OUT";
     case NodeRole::Gnd: return "GND";
     case NodeRole::Terminal: return "T";
     case NodeRole::Sig1: return signalLabel != nullptr && signalLabel[0] != nullptr ? signalLabel[0] : "S1";

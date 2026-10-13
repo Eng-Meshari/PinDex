@@ -15,11 +15,14 @@
 #define PROBE_PERMUTATION_COUNT 24   // three-wire: ordered VCC/DATA/GND on 3 of 4 nodes
 #define PROBE_FOUR_WIRE_COUNT 24     // four-wire: ordered VCC/SIG1/SIG2/GND on all 4 nodes
 #define PROBE_PAIR_COUNT 6           // two-terminal: unordered node pairs
+#define PROBE_MAX_CANDIDATES PROBE_PERMUTATION_COUNT  // tentative mappings kept per cycle
 #define PROBE_MAPPING_TEXT_LEN 16    // one half of the mapping text, "A:VCC B:TRG" + NUL
 #define PROBE_TELEMETRY_TEXT_LEN 22  // one OLED line (21 glyphs) + NUL
 
-// What each physical socket node does in one attempt.
-enum class NodeRole : uint8_t { Unused, Vcc, Data, Gnd, Terminal, Sig1, Sig2 };
+// What each physical socket node does in one attempt. Out is a three-wire
+// DATA node that is the module's output and only ever read
+// (DriverRequirements::dataIsOutput); the table mappings use Data.
+enum class NodeRole : uint8_t { Unused, Vcc, Data, Gnd, Terminal, Sig1, Sig2, Out };
 
 // Roles of nodes A, B, C, D (index 0..3). Socket labels stay separate from
 // GPIO numbers; the engine resolves GPIOs per node.
@@ -60,7 +63,8 @@ enum class ProbePhase : uint8_t {
   Confirming,   // candidate driver + mapping found, awaiting new acquisitions
   Detected,     // confirmed, live telemetry
   Retrying,     // detected, but the shown telemetry is stale
-  NoComponent,  // nothing matched (or the observations were ambiguous)
+  NoComponent,  // nothing matched (or the observations were ambiguous; with several
+                // tentative candidates the engine waits for a selection or a clear)
   Fault,        // latched internal fault; probes INPUT until a retry
 };
 
@@ -154,6 +158,8 @@ struct ProbeStatus {
   ProbeMapping mapping;
   const char *signalLabel[2];    // SIG1/SIG2 names of a four-wire mapping (driver's), else nullptr
   const char *componentName;     // driver getName() of the candidate/active driver, or nullptr
+  EvidenceLevel evidence;        // of the saved driver's latest success; None without one.
+                                 // Candidate = tentative, never a confirmed identification
   bool detected;                 // PROBE_CONFIRM_FRAMES consecutive acquisitions
   bool readingValid;             // telemetry holds a completed sample
   bool readingStale;             // the latest acquisition failed; telemetry is old
@@ -170,6 +176,8 @@ struct ProbeStatus {
   bool measurementUnavailable;   // last cycle failed on measurement errors (e.g. ADC)
   uint8_t hardwareRequiredMask;  // bit i: registered driver i is enabled but has no eligible
                                  // supply (no capable backend, profile off); it is skipped
+  uint8_t candidateCount;        // tentative (Candidate) mappings of the latest completed cycle
+  uint8_t candidateSelected;     // 1-based candidate now saved, 0 = none
   CouplingEvaluation evaluation; // latest coupling evaluation (Serial log; not displayed)
   uint32_t revision;             // changes whenever a displayed field changes
 };
@@ -202,6 +210,17 @@ bool probeRequestClear();
 // detected or it did not accept the command.
 bool probeSendCommand(char command);
 
+// Makes the next tentative candidate of the latest cycle (wrapping) the
+// saved one: whatever runs is released, then that mapping goes through the
+// normal power-off wait, fresh precheck, vetoes and probe() before it is
+// powered or shown. False (nothing changes) while discovery is running,
+// with no candidates, in a fault or with probing disabled.
+bool probeSelectCandidate();
+
+// Mapping of tentative candidate `index` (0-based, < candidateCount), with
+// the roles its driver uses. False if there is none.
+bool probeCandidateMapping(uint8_t index, ProbeMapping &out);
+
 // The detected driver's diagnostic text (cached results only; no bus or pin
 // activity), e.g. every I2C address found. buf is always terminated; false
 // if nothing is detected or the driver has nothing to report.
@@ -211,13 +230,13 @@ bool probeFormatDiagnostics(char *buf, size_t len);
 // (the joined four-node text does not, at the size-1 font):
 //   four-wire  "A:VCC B:TRG" + "C:ECH D:GND"  (SIG names from signalLabel,
 //                                              "S1"/"S2" if null)
-//   three-wire "A:VCC B:DAT" + "C:GND D:---"
+//   three-wire "A:VCC B:DAT" + "C:GND D:---"  ("OUT" for an output-only DATA)
 //   pair       "Pins: A & B" + "C:--- D:---"
 // len is the capacity of each buffer; both are always terminated.
 void formatProbeMapping(const ProbeMapping &mapping, const char *const *signalLabel, char *first,
                         char *second, size_t len);
 
-// "VCC", "DAT", "GND", "T", the signal label (or "S1"/"S2"), "---".
+// "VCC", "DAT", "OUT", "GND", "T", the signal label (or "S1"/"S2"), "---".
 const char *probeRoleName(NodeRole role, const char *const *signalLabel);
 
 const char *probePhaseName(ProbePhase phase);

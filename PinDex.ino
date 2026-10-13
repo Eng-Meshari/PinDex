@@ -1,10 +1,12 @@
 // PinDex - Smart Component & Sensor Identifier
 // Sensor drivers (src/drivers/) behind a generic probe engine on a
 // four-node A/B/C/D socket: a DHT11-compatible three-wire driver, an I2C
-// address scanner and an HC-SR04-compatible driver (four-wire; both need a
-// protected backend this board does not have, the I2C scanner optionally
-// the experimental PINDEX_I2C_GPIO_POWER_ENABLED profile) and a weak-pull
-// passive/switch driver. Powered and passive probing are controlled
+// address scanner, a binary digital-output driver (three-wire; tentative
+// candidates plus a guided verification), an HC-SR04-compatible driver
+// (four-wire; it and the I2C scanner need a protected backend this board
+// does not have, the I2C scanner optionally the experimental
+// PINDEX_I2C_GPIO_POWER_ENABLED profile) and a weak-pull passive/switch
+// driver. Powered and passive probing are controlled
 // separately in config.h (PINDEX_POWERED_PROBING_ENABLED,
 // PINDEX_PASSIVE_PROBING_ENABLED); read the README before enabling any.
 
@@ -47,11 +49,18 @@ static void logProbeStatus(const ProbeStatus &s) {
     }
   }
   if (s.componentName != nullptr) Serial.printf(" %s", s.componentName);
+  char first[PROBE_MAPPING_TEXT_LEN];
+  char second[PROBE_MAPPING_TEXT_LEN];
   if (s.hasMapping) {
-    char first[PROBE_MAPPING_TEXT_LEN];
-    char second[PROBE_MAPPING_TEXT_LEN];
     formatProbeMapping(s.mapping, s.signalLabel, first, second, sizeof first);
     Serial.printf(" [%s %s]", first, second);
+  }
+  // Tentative evidence is never a confirmed identification.
+  if (s.evidence == EvidenceLevel::Candidate) Serial.print(" UNVERIFIED");
+  if (s.evidence == EvidenceLevel::UserVerified) Serial.print(" USER-VERIFIED");
+  if (s.candidateCount > 0) {
+    Serial.printf(" candidates=%u", (unsigned)s.candidateCount);
+    if (s.candidateSelected > 0) Serial.printf(" selected=%u", (unsigned)s.candidateSelected);
   }
   if (s.readingValid) {
     Serial.printf(" \"%s\"", s.telemetry1);
@@ -72,6 +81,15 @@ static void logProbeStatus(const ProbeStatus &s) {
     Serial.printf(" precheck=%s; send 'r' to retry", precheckResultName(s.precheck));
   }
   Serial.println();
+  if (s.phase == ProbePhase::NoComponent && s.candidateCount > 1) {  // ambiguous: list, never pick
+    for (uint8_t i = 0; i < s.candidateCount; i++) {
+      ProbeMapping m;
+      if (!probeCandidateMapping(i, m)) continue;
+      formatProbeMapping(m, nullptr, first, second, sizeof first);
+      Serial.printf("candidate %u/%u: %s %s\n", (unsigned)(i + 1), (unsigned)s.candidateCount, first, second);
+    }
+    Serial.println("candidates: send 'n' to select the next, 'c' to clear and rescan");
+  }
   if (s.detected && !loggedDetected) printDiagnostics();  // once per detection
   loggedDetected = s.detected;
 }
@@ -117,8 +135,12 @@ static void logEvaluation(const CouplingEvaluation &e, unsigned long now) {
 //   c  clear the result and rescan (e.g. a switch left OPEN: an open switch
 //      cannot be told apart from removal)
 //   i  print the detected driver's diagnostics (e.g. every I2C address)
+//   n  select the next tentative candidate mapping (re-checked and
+//      re-probed before it is powered or shown)
 //   other letters go to the detected driver (passive: l = guided LDR
-//   calibration start/cancel, d = take dark reference, b = take bright)
+//   calibration start/cancel, d = take dark reference, b = take bright;
+//   binary: v = verification start/cancel, q = mark idle, a = mark active,
+//   p = weak pull-up on/off for this binding)
 static void handleSerialCommands() {
   while (Serial.available() > 0) {
     const int c = Serial.read();
@@ -128,6 +150,13 @@ static void handleSerialCommands() {
     } else if (c == 'c' || c == 'C') {
       Serial.println(probeRequestClear() ? "clear: result cleared, rescanning"
                                          : "clear: ignored (probing disabled)");
+    } else if (c == 'n' || c == 'N') {
+      if (probeSelectCandidate()) {
+        Serial.printf("select: candidate %u/%u, rechecking before power\n",
+                      (unsigned)probeStatus().candidateSelected, (unsigned)probeStatus().candidateCount);
+      } else {
+        Serial.println("select: ignored (no candidates, or discovery still running)");
+      }
     } else if (c == 'i' || c == 'I') {
       printDiagnostics();
     } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
@@ -161,7 +190,8 @@ void setup() {
                     sensorDriverAt(i)->getName());
     }
   }
-  Serial.println("Serial: r=retry fault, c=clear/rescan, i=diagnostics, l/d/b=guided LDR calibration.");
+  Serial.println("Serial: r=retry fault, c=clear/rescan, i=diagnostics, n=next binary candidate,");
+  Serial.println("        l/d/b=guided LDR calibration, v/q/a=guided binary verification, p=OUT pull-up.");
 
   displayOk = initDisplay();
   if (displayOk) {

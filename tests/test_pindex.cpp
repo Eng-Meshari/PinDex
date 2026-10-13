@@ -5,7 +5,7 @@
 //   SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp
 //        src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp
 //        src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp
-//        src/drivers/weak_pull_meter.cpp"
+//        src/drivers/weak_pull_meter.cpp src/drivers/binary_driver.cpp"
 //   g++ -std=c++17 -Wall -Wextra -Itests/mock -I. -DPINDEX_POWERED_PROBING_ENABLED=1
 //       -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=0 $SRC -o build/test_all
 //   1/1/1 -> build/test_i2c_gpio   (the experimental GPIO profile on)
@@ -33,6 +33,7 @@
 #include "four_wire_backend.h"
 #include "probe_engine.h"
 #include "sensor_driver.h"
+#include "src/drivers/binary_driver.h"
 #include "src/drivers/dht11_driver.h"
 #include "src/drivers/driver_registry.h"
 #include "src/drivers/i2c_bus.h"
@@ -61,7 +62,7 @@ static int failures = 0;
 
 // ---- Test registry (replaces src/drivers/driver_registry.cpp) --------------
 
-static SensorDriver *testDrivers[4] = {};
+static SensorDriver *testDrivers[5] = {};
 static size_t testDriverCount = 0;
 
 size_t sensorDriverCount() { return testDriverCount; }
@@ -71,9 +72,9 @@ SensorDriver *sensorDriverAt(size_t index) {
 }
 
 static void useDrivers(SensorDriver *a = nullptr, SensorDriver *b = nullptr,
-                       SensorDriver *c = nullptr, SensorDriver *d = nullptr) {
+                       SensorDriver *c = nullptr, SensorDriver *d = nullptr, SensorDriver *e = nullptr) {
   testDriverCount = 0;
-  for (SensorDriver *x : {a, b, c, d}) {
+  for (SensorDriver *x : {a, b, c, d, e}) {
     if (x != nullptr) testDrivers[testDriverCount++] = x;
   }
 }
@@ -189,6 +190,15 @@ static int roleCount(const ProbeMapping &m, NodeRole role) {
   int count = 0;
   for (NodeRole r : m.role) count += r == role ? 1 : 0;
   return count;
+}
+
+// A table mapping as an output-only DATA driver (dataIsOutput) uses it.
+[[maybe_unused]] static ProbeMapping outRoles(const ProbeMapping &m) {
+  ProbeMapping o = m;
+  for (NodeRole &r : o.role) {
+    if (r == NodeRole::Data) r = NodeRole::Out;
+  }
+  return o;
 }
 
 static void testMappingTables() {
@@ -319,6 +329,22 @@ static void testMappingText() {
   }
   formatProbeMapping(PROBE_FOUR_WIRE_MAPPINGS[3], kI2cLabels, a, b, sizeof a);
   CHECK(same(a, "A:VCC B:GND") && same(b, "C:SDA D:SCL"));  // the README example
+
+  // An output-only DATA (the binary driver) reads OUT; DATA stays DAT.
+  CHECK(same(probeRoleName(NodeRole::Out, nullptr), "OUT") && same(probeRoleName(NodeRole::Data, nullptr), "DAT"));
+  for (const ProbeMapping &m : PROBE_PERMUTATIONS) {
+    char d1[PROBE_MAPPING_TEXT_LEN];
+    char d2[PROBE_MAPPING_TEXT_LEN];
+    formatProbeMapping(m, nullptr, d1, d2, sizeof d1);
+    formatProbeMapping(outRoles(m), nullptr, a, b, sizeof a);
+    const int out = probeNodeWithRole(m, NodeRole::Data);
+    char *dat = strstr(out < 2 ? d1 : d2, "DAT");
+    if (dat != nullptr) memcpy(dat, "OUT", 3);
+    CHECK(dat != nullptr && same(a, d1) && same(b, d2));
+    CHECK(strlen(a) * 6 <= OLED_WIDTH && strlen(b) * 6 <= OLED_WIDTH);
+  }
+  formatProbeMapping(outRoles(PROBE_PERMUTATIONS[0]), nullptr, a, b, sizeof a);
+  CHECK(same(a, "A:VCC B:OUT") && same(b, "C:GND D:---"));  // the README example
 }
 
 static void testPassiveEstimate() {
@@ -721,6 +747,45 @@ static int responseLevel(uint64_t t) {
   return HIGH;  // released after the frame
 }
 
+// ---- Simulated binary digital-output module ----------------------------------
+// Three pins wired as PROBE_PERMUTATIONS[wiring] (its VCC, OUT, GND). Powered
+// only while its own VCC GPIO drives HIGH and its GND GPIO drives LOW; then
+// it drives OUT strongly (an open collector only sinks LOW). Unpowered or
+// released, OUT is left to the resistor network: it floats or follows a pull.
+
+struct SimBinary {
+  bool attached = false;
+  int wiring = 0;
+  bool activeLow = true;       // OUT level while the stimulus is applied: LOW (else HIGH)
+  bool active = false;         // the real stimulus
+  bool openCollector = false;  // sinks LOW, releases otherwise
+  uint32_t startupMs = 0;      // after power-up, the other level for this long
+  uint32_t toggleMs = 0;       // > 0: also flips by itself every toggleMs
+  bool powered = false;
+  uint64_t poweredSinceUs = 0;
+};
+static SimBinary binSim;
+static BinaryDriver binary;  // production driver (generic profile), registered per test
+
+static uint8_t binGpio(NodeRole role) { return gpioOf(probeNodeWithRole(PROBE_PERMUTATIONS[binSim.wiring], role)); }
+
+static void binaryOnPinChange() {
+  const bool now = binSim.attached && mock::drivesHigh(binGpio(NodeRole::Vcc)) && mock::drivesLow(binGpio(NodeRole::Gnd));
+  if (now && !binSim.powered) binSim.poweredSinceUs = mock::nowUs;
+  binSim.powered = now;
+}
+
+// The module's OUT level, or -1 where the network decides.
+static int binaryOut() {
+  if (!binSim.attached || !binSim.powered) return -1;
+  const uint64_t ms = (mock::nowUs - binSim.poweredSinceUs) / 1000;
+  bool high = binSim.active != binSim.activeLow;
+  if (ms < binSim.startupMs) high = !high;
+  if (binSim.toggleMs > 0 && (ms / binSim.toggleMs) % 2 == 1) high = !high;
+  if (!high) return LOW;
+  return binSim.openCollector ? -1 : HIGH;
+}
+
 // ---- Fake protected four-wire backend (replaces four_wire_backend.cpp) -----
 // Stands in for a reviewed routing interface so the engine's four-wire
 // path can be exercised. caps = 0 behaves like the shipped backend
@@ -1047,6 +1112,7 @@ static void onPinChange(uint8_t pin, bool isPinMode) {
     wasDrivingHigh[pin] = mock::drivesHigh(pin);
   }
   if (sonar.attached && pin == sonarGpio(NodeRole::Sig1)) sonarOnTrig();
+  binaryOnPinChange();
   if (!sensor.attached) return;
 
   const bool poweredNow = mock::drivesHigh(wiringGpio(NodeRole::Vcc)) &&
@@ -1080,6 +1146,10 @@ static int readHook(uint8_t pin) {
     if (sensor.stuckLow) return LOW;
     if (sensor.responding) return responseLevel(mock::nowUs - sensor.responseStartUs);
   }
+  if (binSim.attached && pin == binGpio(NodeRole::Data)) {
+    const int level = binaryOut();
+    if (level >= 0) return level;  // driven: stronger than any weak pull
+  }
   if (flakyA && pin == gpioOf(0) && mock::pins[pin].mode == INPUT_PULLUP) {
     return (flakyReads++ % 2 == 0) ? HIGH : LOW;
   }
@@ -1096,6 +1166,7 @@ static void resetWorld(uint64_t startUs = 1000000ULL, uint16_t backendCaps = 0) 
   mock::reset(startUs);
   sensor = SimSensor();
   sonar = SimSonar();
+  binSim = SimBinary();
   i2cSim = SimI2c();
   backend = FakeBackend();
   backend.caps = backendCaps;
@@ -1144,7 +1215,8 @@ class FakeDriver final : public SensorDriver {
             : topology == ProbeTopology::FourWirePowered ? SupplyProfile::Backend5V
                                                          : SupplyProfile::None,
             false,
-            {nullptr, nullptr}},
+            {nullptr, nullptr},
+            false},
         id_(id),
         name_(name) {}
 
@@ -2269,6 +2341,397 @@ static void testI2cHandoff() {
   ud.reset();
   resetTestPins();
   CHECK(i2cSim.begins == 1);  // nothing restarted the I2C controller
+}
+
+// ---- Binary digital sensor driver, driven directly (every build) ------------
+
+// GND LOW, then VCC HIGH on PROBE_PERMUTATIONS[perm]; OUT and the fourth
+// node stay plain INPUT (the engine's job, done manually).
+static void powerBinaryByHand(int perm) {
+  resetTestPins();
+  const ProbeMapping &m = PROBE_PERMUTATIONS[perm];
+  const uint8_t vcc = gpioOf(probeNodeWithRole(m, NodeRole::Vcc));
+  const uint8_t gnd = gpioOf(probeNodeWithRole(m, NodeRole::Gnd));
+  digitalWrite(gnd, LOW);
+  pinMode(gnd, OUTPUT);
+  digitalWrite(vcc, HIGH);
+  pinMode(vcc, OUTPUT);
+}
+
+// probe() once per simulated ms until it completes (or maxMs pass).
+static bool driveBinaryProbe(BinaryDriver &d, const ProbeContext &c, uint32_t maxMs = 2000) {
+  for (uint32_t i = 0; i < maxMs; i++) {
+    if (d.probe(c)) return true;
+    if (d.getOperationStatus() != DriverOperationStatus::Pending) return false;
+    advanceTo(mock::nowUs + 1000);
+  }
+  return false;
+}
+
+// readSample() once per BINARY_SAMPLE_INTERVAL_MS for `ms`. Every sample
+// must succeed and fit one OLED row; the latest lines stay in l1/l2.
+static bool sampleBinary(BinaryDriver &d, uint32_t ms, char *l1, char *l2) {
+  bool ok = true;
+  for (uint32_t t = 0; t < ms; t += BINARY_SAMPLE_INTERVAL_MS) {
+    advanceTo(mock::nowUs + BINARY_SAMPLE_INTERVAL_MS * 1000ULL);
+    ok = d.readSample(l1, l2, PROBE_TELEMETRY_TEXT_LEN) && strlen(l1) * 6 <= OLED_WIDTH &&
+         strlen(l2) * 6 <= OLED_WIDTH && ok;
+  }
+  return ok;
+}
+
+// The simulated module, fresh, on mapping 0 (A VCC, B OUT, C GND), powered
+// and probed by `d`.
+static bool bindBinary(BinaryDriver &d, bool activeLow) {
+  binSim = SimBinary();
+  binSim.attached = true;
+  binSim.activeLow = activeLow;
+  powerBinaryByHand(0);
+  d.reset();
+  return driveBinaryProbe(d, poweredContext(0));
+}
+
+// Events since `from` that drove or wrote `pin` (any output mode or a latch write).
+static int driveEventsOn(uint8_t pin, size_t from, uint64_t untilUs = UINT64_MAX) {
+  int n = 0;
+  for (size_t i = from; i < mock::eventCount && mock::events[i].us <= untilUs; i++) {
+    const mock::Event &e = mock::events[i];
+    if (e.pin == pin && (!e.isPinMode || (e.mode & OUTPUT) == OUTPUT)) n++;
+  }
+  return n;
+}
+
+static void testBinaryDriverContract() {
+  useDrivers();  // the engine stays idle; this test drives the driver itself
+  resetWorld();
+  BinaryDriver d;
+  char l1[PROBE_TELEMETRY_TEXT_LEN];
+  char l2[PROBE_TELEMETRY_TEXT_LEN];
+  const DriverRequirements &r = d.getRequirements();
+  CHECK(same(d.getName(), "Binary Digital Sensor") && strlen(d.getName()) * 6 <= OLED_WIDTH);
+  CHECK(r.topology == ProbeTopology::ThreeWirePowered && r.excitation == ExcitationPolicy::ProtectedActive);
+  CHECK(r.supply == SupplyProfile::GpioLogic && r.dataIsOutput && r.openDrainSignals);
+  CHECK(r.powerStabilizeMs == 0 && r.sampleIntervalMs == BINARY_SAMPLE_INTERVAL_MS);
+  CHECK(r.operationTimeoutMs > BINARY_WARMUP_MS + BINARY_MAX_OBSERVE_MS + 2 * BINARY_BIAS_SETTLE_MS);
+  CHECK(d.evidence() == EvidenceLevel::None);
+
+  // Bad buffers, sampling before a probe, the wrong topology, a command
+  // with nothing bound: refused, no pin touched.
+  size_t quiet = mock::eventCount;
+  CHECK(!d.readSample(nullptr, l2, sizeof l2) && same(d.getFailureReason(), "invalid-buffer"));
+  memset(l1, 'x', sizeof l1);
+  CHECK(!d.readSample(l1, l2, 0) && l1[0] == 'x');
+  CHECK(!d.readSample(l1, l2, sizeof l1) && same(d.getFailureReason(), "not-probed"));
+  CHECK(l1[0] == '\0' && l2[0] == '\0');
+  CHECK(!d.probe(pairContext(0)) && same(d.getFailureReason(), "topology-mismatch"));
+  CHECK(!d.probe(fourWireContext(0)) && !d.handleUserCommand('v'));
+  CHECK(mock::eventCount == quiet);
+
+  // All 24 mappings: the module wired to each in turn is a Candidate after
+  // the warm-up, a stable window and the floating check, never more. OUT
+  // is only ever an input and the fourth node is never touched.
+  for (int i = 0; i < PROBE_PERMUTATION_COUNT; i++) {
+    const ProbeMapping &m = PROBE_PERMUTATIONS[i];
+    const uint8_t out = gpioOf(probeNodeWithRole(m, NodeRole::Data));
+    const uint8_t unused = gpioOf(probeNodeWithRole(m, NodeRole::Unused));
+    binSim = SimBinary();
+    binSim.attached = true;
+    binSim.wiring = i;
+    binSim.activeLow = i % 2 == 0;  // idle HIGH on even entries, LOW on odd ones
+    powerBinaryByHand(i);
+    d.reset();
+    const size_t from = mock::eventCount;
+    const uint64_t t0 = mock::nowUs;
+    CHECK(driveBinaryProbe(d, poweredContext(i)));
+    const uint64_t tookMs = (mock::nowUs - t0) / 1000;
+    CHECK(tookMs >= BINARY_WARMUP_MS + BINARY_STABLE_MS &&
+          tookMs <= BINARY_WARMUP_MS + BINARY_STABLE_MS + 2 * BINARY_BIAS_SETTLE_MS + 30);
+    CHECK(d.evidence() == EvidenceLevel::Candidate && d.getOperationStatus() == DriverOperationStatus::Succeeded);
+    CHECK(driveEventsOn(out, from) == 0 && mock::pins[out].mode == INPUT);
+    bool unusedTouched = false;
+    for (size_t e = from; e < mock::eventCount; e++) unusedTouched = unusedTouched || mock::events[e].pin == unused;
+    CHECK(!unusedTouched && mock::pins[unused].mode == INPUT);
+    CHECK(sampleBinary(d, 30, l1, l2));
+    CHECK(same(l1, i % 2 == 0 ? "Level: HIGH (1)" : "Level: LOW (0)") && same(l2, "Type: Digital IO"));
+  }
+
+  // Nothing attached: a floating OUT is stable but follows the opposing
+  // pull, so it is no evidence; with the pull-up profile the line just
+  // follows that bias. The bias is removed on failure.
+  binSim = SimBinary();
+  const uint8_t outB = gpioOf(1);  // OUT of mapping 0
+  powerBinaryByHand(0);
+  d.reset();
+  CHECK(!driveBinaryProbe(d, poweredContext(0)) && same(d.getFailureReason(), "follows-bias"));
+  CHECK(d.evidence() == EvidenceLevel::None && mock::pins[outB].mode == INPUT);
+  BinaryProfile pulled = kBinaryGenericProfile;
+  pulled.bias = BinaryBias::WeakPullUp;
+  BinaryDriver withPullup(pulled);
+  CHECK(!driveBinaryProbe(withPullup, poweredContext(0)) && same(withPullup.getFailureReason(), "follows-bias"));
+  CHECK(mock::pins[outB].mode == INPUT);
+
+  // An open collector with no pull-up of its own: released, it is only a
+  // biased line (no evidence); asserted, it sinks against the pull-up.
+  binSim.attached = true;
+  binSim.openCollector = true;  // active-low
+  powerBinaryByHand(0);
+  CHECK(!driveBinaryProbe(withPullup, poweredContext(0)) && same(withPullup.getFailureReason(), "follows-bias"));
+  binSim.active = true;
+  CHECK(driveBinaryProbe(withPullup, poweredContext(0)) && withPullup.evidence() == EvidenceLevel::Candidate);
+  CHECK(mock::pins[outB].mode == INPUT_PULLUP);  // the profile's bias while bound
+  binSim.active = false;
+  CHECK(sampleBinary(withPullup, 50, l1, l2) && same(l1, "Level: HIGH (1)"));
+  withPullup.reset();
+  CHECK(mock::pins[outB].mode == INPUT);  // reset() removes it
+
+  // With the generic profile an asserted open collector is a Candidate;
+  // released, the plain input floats. 'p' selects the weak pull-up for
+  // this binding: the change is never an edge or evidence, and the guided
+  // test then works as usual. 'p' again, or reset(), removes it.
+  binSim.active = true;
+  powerBinaryByHand(0);
+  d.reset();
+  CHECK(driveBinaryProbe(d, poweredContext(0)) && mock::pins[outB].mode == INPUT);
+  binSim.active = false;
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: LOW (0)"));  // floating: reads anything
+  char diag[128];
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "bias=none") != nullptr);
+  CHECK(d.handleUserCommand('p') && mock::pins[outB].mode == INPUT_PULLUP);
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: HIGH (1)") && same(l2, "Weak pull-up: ON"));
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "edges=0") != nullptr);
+  CHECK(strstr(diag, "bias=pull-up") != nullptr && d.evidence() == EvidenceLevel::Candidate);
+  const uint32_t window = BINARY_VERIFY_WINDOW_MS + 100;
+  CHECK(d.handleUserCommand('v') && d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  binSim.active = true;
+  CHECK(d.handleUserCommand('a') && sampleBinary(d, window, l1, l2));
+  binSim.active = false;
+  CHECK(d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  CHECK(d.evidence() == EvidenceLevel::UserVerified && same(l2, "Verified active-LOW"));
+  CHECK(d.handleUserCommand('p') && mock::pins[outB].mode == INPUT && d.evidence() == EvidenceLevel::Candidate);
+  CHECK(d.handleUserCommand('p') && mock::pins[outB].mode == INPUT_PULLUP);
+  d.reset();
+  CHECK(mock::pins[outB].mode == INPUT);
+
+  // A rail-clamped wire (OUT tied to GND) is stable and holds against the
+  // pull exactly like an output: a Candidate at most.
+  binSim = SimBinary();
+  connect(1, 2, 1.0);
+  powerBinaryByHand(0);
+  d.reset();
+  CHECK(driveBinaryProbe(d, poweredContext(0)) && d.evidence() == EvidenceLevel::Candidate);
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: LOW (0)"));
+  netReset();
+
+  // Excessive toggling, or a level that never holds long enough, is
+  // inconclusive; both end within the observation budget, bias removed.
+  binSim.attached = true;
+  binSim.toggleMs = 30;
+  powerBinaryByHand(0);
+  d.reset();
+  uint64_t t0 = mock::nowUs;
+  CHECK(!driveBinaryProbe(d, poweredContext(0)) && same(d.getFailureReason(), "toggling"));
+  CHECK((mock::nowUs - t0) / 1000 <= BINARY_WARMUP_MS + BINARY_MAX_OBSERVE_MS && mock::pins[outB].mode == INPUT);
+  BinaryProfile slow = kBinaryGenericProfile;
+  slow.stableMs = 400;  // longer than the 300 ms between the module's flips
+  BinaryDriver slowDriver(slow);
+  binSim.toggleMs = 300;
+  powerBinaryByHand(0);
+  t0 = mock::nowUs;
+  CHECK(!driveBinaryProbe(slowDriver, poweredContext(0)) && same(slowDriver.getFailureReason(), "no-stable-level"));
+  const uint64_t tookMs = (mock::nowUs - t0) / 1000;
+  CHECK(tookMs + 1 >= BINARY_WARMUP_MS + BINARY_MAX_OBSERVE_MS &&  // +1: sub-ms clock offset
+        tookMs <= BINARY_WARMUP_MS + BINARY_MAX_OBSERVE_MS + BINARY_SAMPLE_INTERVAL_MS + 2);
+  CHECK(slowDriver.getRequirements().operationTimeoutMs > tookMs);
+
+  // Arguments changed mid-operation, or an overlapping sample: refused,
+  // and the pending observation is dropped with its bias.
+  CHECK(bindBinary(withPullup, true));
+  CHECK(!withPullup.probe(poweredContext(0)) && withPullup.getOperationStatus() == DriverOperationStatus::Pending);
+  CHECK(!withPullup.probe(poweredContext(1)) && same(withPullup.getFailureReason(), "contract-violation"));
+  CHECK(mock::pins[outB].mode == INPUT);
+  CHECK(!withPullup.probe(poweredContext(0)));
+  CHECK(!withPullup.readSample(l1, l2, sizeof l1) && same(withPullup.getFailureReason(), "contract-violation"));
+  CHECK(mock::pins[outB].mode == INPUT && withPullup.evidence() == EvidenceLevel::None);
+
+  // reset() mid-warm-up (pull-up held) or mid-check (the opposing
+  // pull-down): every pull removed, nothing reported afterwards, and a
+  // second reset() touches nothing.
+  CHECK(!withPullup.probe(poweredContext(0)) && mock::pins[outB].mode == INPUT_PULLUP);
+  withPullup.reset();
+  CHECK(mock::pins[outB].mode == INPUT && withPullup.getOperationStatus() == DriverOperationStatus::Idle);
+  quiet = mock::eventCount;
+  withPullup.reset();
+  CHECK(mock::eventCount == quiet);
+  CHECK(!withPullup.readSample(l1, l2, sizeof l1) && same(withPullup.getFailureReason(), "not-probed"));
+  d.reset();
+  CHECK(!d.probe(poweredContext(0)));  // the module idles HIGH: the check pulls down
+  for (int guard = 0; mock::pins[outB].mode != INPUT_PULLDOWN && guard < 1000; guard++) {
+    advanceTo(mock::nowUs + 1000);
+    d.probe(poweredContext(0));
+  }
+  CHECK(mock::pins[outB].mode == INPUT_PULLDOWN);
+  d.reset();
+  CHECK(mock::pins[outB].mode == INPUT && d.evidence() == EvidenceLevel::None);
+  quiet = mock::eventCount;
+  advanceTo(mock::nowUs + 500000);
+  CHECK(!d.readSample(l1, l2, sizeof l1) && l1[0] == '\0' && mock::eventCount == quiet);
+
+  // millis() wraps during the observation: same timing, same results.
+  resetWorld((static_cast<uint64_t>(0xFFFFFFFFu) - 150) * 1000);
+  t0 = mock::nowUs;
+  CHECK(bindBinary(d, true));
+  CHECK(millis() < 1000);  // the counter really wrapped
+  CHECK((mock::nowUs - t0) / 1000 >= BINARY_WARMUP_MS + BINARY_STABLE_MS &&
+        (mock::nowUs - t0) / 1000 <= BINARY_WARMUP_MS + BINARY_STABLE_MS + 2 * BINARY_BIAS_SETTLE_MS + 30);
+  resetWorld((static_cast<uint64_t>(0xFFFFFFFFu) - 150) * 1000);
+  binSim.attached = true;
+  binSim.toggleMs = 30;
+  powerBinaryByHand(0);
+  d.reset();
+  t0 = mock::nowUs;
+  CHECK(!driveBinaryProbe(d, poweredContext(0)) && same(d.getFailureReason(), "toggling"));
+  CHECK((mock::nowUs - t0) / 1000 <= BINARY_WARMUP_MS + BINARY_MAX_OBSERVE_MS);
+  CHECK(mock::attachCalls == 0);  // polled only: no interrupt is ever attached
+  resetTestPins();
+}
+
+// Guided verification: the user marks idle, applies the stimulus, marks
+// active, removes it and marks idle again. Polarity comes from those
+// marked phases only; anything else stays inconclusive.
+static void testBinaryGuidedVerification() {
+  useDrivers();
+  resetWorld();
+  BinaryDriver d;
+  char l1[PROBE_TELEMETRY_TEXT_LEN];
+  char l2[PROBE_TELEMETRY_TEXT_LEN];
+  const uint32_t window = BINARY_VERIFY_WINDOW_MS + 100;
+
+  // Active-low: idle HIGH, active LOW.
+  CHECK(bindBinary(d, true));
+  CHECK(!d.handleUserCommand('q') && !d.handleUserCommand('a'));  // no session yet
+  CHECK(d.handleUserCommand('v'));
+  CHECK(sampleBinary(d, 20, l1, l2) && same(l1, "Level: HIGH (1)") && same(l2, "No stimulus, send q"));
+  CHECK(!d.handleUserCommand('a'));  // the idle phase comes first
+  CHECK(d.handleUserCommand('q'));
+  CHECK(sampleBinary(d, 20, l1, l2) && same(l2, "Reading idle..."));
+  CHECK(sampleBinary(d, window, l1, l2) && same(l2, "Stimulus on, send a"));
+  binSim.active = true;
+  CHECK(d.handleUserCommand('a'));
+  CHECK(sampleBinary(d, window, l1, l2) && same(l2, "Stimulus off, send q"));
+  CHECK(same(l1, "Level: LOW (0)") && d.evidence() == EvidenceLevel::Candidate);  // not yet
+  binSim.active = false;
+  CHECK(d.handleUserCommand('q'));
+  CHECK(sampleBinary(d, window, l1, l2));
+  CHECK(d.evidence() == EvidenceLevel::UserVerified);
+  CHECK(same(l1, "State: IDLE (1)") && same(l2, "Verified active-LOW"));
+  binSim.active = true;
+  CHECK(sampleBinary(d, 50, l1, l2) && same(l1, "State: ACTIVE (0)"));
+  CHECK(sampleBinary(d, BINARY_MESSAGE_MS, l1, l2) && same(l2, "Type: Digital IO"));
+
+  // It belongs to this binding: a new probe() (or reset()) discards it.
+  CHECK(bindBinary(d, true) && d.evidence() == EvidenceLevel::Candidate);
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: HIGH (1)"));
+
+  // Active-high: idle LOW, active HIGH.
+  CHECK(bindBinary(d, false));
+  CHECK(d.handleUserCommand('v') && d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  binSim.active = true;
+  CHECK(d.handleUserCommand('a') && sampleBinary(d, window, l1, l2));
+  binSim.active = false;
+  CHECK(d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  CHECK(d.evidence() == EvidenceLevel::UserVerified && same(l2, "Verified active-HIGH"));
+  CHECK(same(l1, "State: IDLE (0)"));
+  binSim.active = true;
+  CHECK(sampleBinary(d, 50, l1, l2) && same(l1, "State: ACTIVE (1)"));
+  // A new session voids the result until it completes; 'v' again cancels.
+  CHECK(d.handleUserCommand('v') && d.evidence() == EvidenceLevel::Candidate);
+  CHECK(sampleBinary(d, 20, l1, l2) && same(l1, "Level: HIGH (1)"));
+  CHECK(d.handleUserCommand('v') && !d.handleUserCommand('q'));
+
+  // Stimulus "applied" with no change: inconclusive, nothing learnt.
+  CHECK(bindBinary(d, true));
+  CHECK(d.handleUserCommand('v') && d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  CHECK(d.handleUserCommand('a') && sampleBinary(d, window, l1, l2));
+  CHECK(same(l2, "Verify: no change") && d.evidence() == EvidenceLevel::Candidate);
+  CHECK(same(l1, "Level: HIGH (1)") && !d.handleUserCommand('q'));  // the session is over
+
+  // No return to the idle level: inconclusive.
+  CHECK(d.handleUserCommand('v') && d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));
+  binSim.active = true;
+  CHECK(d.handleUserCommand('a') && sampleBinary(d, window, l1, l2));
+  CHECK(d.handleUserCommand('q') && sampleBinary(d, window, l1, l2));  // still applied
+  CHECK(same(l2, "Verify: no return") && d.evidence() == EvidenceLevel::Candidate);
+
+  // A level that never settles after a mark: that step is redone, after a
+  // bounded wait.
+  binSim.active = false;
+  binSim.toggleMs = 100;
+  CHECK(d.handleUserCommand('v') && d.handleUserCommand('q'));
+  CHECK(sampleBinary(d, BINARY_VERIFY_TIMEOUT_MS + 20, l1, l2) && same(l2, "Verify: unsteady"));
+  CHECK(!d.handleUserCommand('a') && d.handleUserCommand('q'));  // the idle step again
+  CHECK(d.evidence() == EvidenceLevel::Candidate);
+
+  // A module-specific profile may state the polarity: shown as a state,
+  // still only a Candidate.
+  BinaryProfile lowProfile = kBinaryGenericProfile;
+  lowProfile.polarity = BinaryPolarity::ActiveLow;
+  BinaryDriver known(lowProfile);
+  CHECK(bindBinary(known, true));
+  CHECK(sampleBinary(known, 30, l1, l2) && same(l1, "State: IDLE (1)"));
+  binSim.active = true;
+  CHECK(sampleBinary(known, 30, l1, l2) && same(l1, "State: ACTIVE (0)"));
+  CHECK(known.evidence() == EvidenceLevel::Candidate);
+  known.reset();
+  d.reset();
+  resetTestPins();
+}
+
+// Monitoring is polled: what one sample per BINARY_SAMPLE_INTERVAL_MS can
+// and cannot see. A constant level is a valid state, never a failure.
+static void testBinarySamplingLimits() {
+  useDrivers();
+  resetWorld();
+  BinaryDriver d;
+  char l1[PROBE_TELEMETRY_TEXT_LEN];
+  char l2[PROBE_TELEMETRY_TEXT_LEN];
+  char diag[128];
+  CHECK(bindBinary(d, true));  // idle HIGH
+  CHECK(sampleBinary(d, 10000, l1, l2) && same(l1, "Level: HIGH (1)"));
+  CHECK(d.getOperationStatus() == DriverOperationStatus::Succeeded);
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "edges=0") != nullptr);
+  CHECK(strstr(diag, "polarity=unknown") != nullptr);
+
+  // A pulse between two samples is missed entirely.
+  binSim.active = true;
+  advanceTo(mock::nowUs + BINARY_SAMPLE_INTERVAL_MS / 2 * 1000ULL);
+  binSim.active = false;
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: HIGH (1)"));
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "edges=0") != nullptr);
+
+  // One seen by a single sample is counted, but it is shorter than the
+  // debounce, so the shown level does not change.
+  binSim.active = true;
+  CHECK(sampleBinary(d, BINARY_SAMPLE_INTERVAL_MS, l1, l2) && same(l1, "Level: HIGH (1)"));
+  binSim.active = false;
+  CHECK(sampleBinary(d, 30, l1, l2) && same(l1, "Level: HIGH (1)"));
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "edges=2") != nullptr);
+
+  // Held past the debounce: shown, and so is the return. No long debounce
+  // hides a ~30 ms pulse.
+  binSim.active = true;
+  CHECK(sampleBinary(d, BINARY_DEBOUNCE_MS + 2 * BINARY_SAMPLE_INTERVAL_MS, l1, l2) && same(l1, "Level: LOW (0)"));
+  binSim.active = false;
+  CHECK(sampleBinary(d, BINARY_DEBOUNCE_MS + 2 * BINARY_SAMPLE_INTERVAL_MS, l1, l2) && same(l1, "Level: HIGH (1)"));
+  CHECK(d.formatDiagnostics(diag, sizeof diag) && strstr(diag, "edges=4") != nullptr);
+
+  // Every text the result screen can show for this driver fits a row.
+  for (const char *t : {"Binary Digital Sensor", "State: ACTIVE (0)", "Level: HIGH (1)", "Stimulus off, send q",
+                        "Verified active-HIGH", "LIVE UNVERIFIED 24/24", "LIVE USER VERIFIED", "24 possible pinouts",
+                        "Send 'n' to select"}) {
+    CHECK(strlen(t) * 6 <= OLED_WIDTH);
+  }
+  d.reset();
+  resetTestPins();
 }
 
 // ---- Coupling policy: classification and decisions (every build) -----------
@@ -3478,6 +3941,262 @@ static void testI2cNoGpioPower() {
 
 #endif  // PINDEX_I2C_GPIO_POWER_ENABLED
 
+// ---- Binary digital sensor through the engine ----------------------------------
+
+static void resetWithBinary(uint64_t startUs = 1000000ULL) {
+  useDrivers(&binary);
+  resetWorld(startUs);
+}
+
+// Index of the first event at or after `us`.
+static size_t eventAt(uint64_t us) {
+  size_t i = 0;
+  while (i < mock::eventCount && mock::events[i].us < us) i++;
+  return i;
+}
+
+// Time of the first pinMode(pin, mode) within [fromUs, toUs], or UINT64_MAX.
+static uint64_t firstModeAt(uint8_t pin, uint8_t mode, uint64_t fromUs, uint64_t toUs) {
+  for (size_t i = eventAt(fromUs); i < mock::eventCount && mock::events[i].us <= toUs; i++) {
+    const mock::Event &e = mock::events[i];
+    if (e.pin == pin && e.isPinMode && e.mode == mode) return e.us;
+  }
+  return UINT64_MAX;
+}
+
+// An empty socket: all 24 mappings are powered in table order; each OUT
+// floats and follows the opposing pull, so nothing is a candidate. OUT is
+// never driven, the engine never pulls it up, and the fourth node stays
+// plain INPUT.
+static void testBinaryEmptyScan() {
+  resetWithBinary();
+  CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
+  CHECK(probeStatus().scanTotal == PROBE_PERMUTATION_COUNT);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
+  CHECK(same(probeStatus().lastError, "follows-bias"));
+  CHECK(probeStatus().candidateCount == 0 && !probeStatus().hasMapping);
+  CHECK(probeStatus().evidence == EvidenceLevel::None && allProbesPlainInput());
+  const SessionLog log = collectSessions();
+  CHECK(log.violations == 0 && log.count == PROBE_PERMUTATION_COUNT);
+  for (int i = 0; i < log.count && i < PROBE_PERMUTATION_COUNT; i++) {
+    const ProbeMapping &m = PROBE_PERMUTATIONS[i];
+    const Session &x = log.s[i];
+    const uint8_t out = gpioOf(probeNodeWithRole(m, NodeRole::Data));
+    CHECK(sessionPowers(x, m) && unusedStayedInput(x, m) && x.data < 0 && x.endUs != UINT64_MAX);
+    CHECK(driveEventsOn(out, eventAt(x.startUs), x.endUs) == 0);
+    // The first pull on OUT is the driver's floating check, after the
+    // warm-up and the stable window: none at power-up.
+    const uint64_t pullUs = firstModeAt(out, INPUT_PULLUP, x.startUs, x.endUs);
+    CHECK(pullUs != UINT64_MAX && pullUs - x.startUs >= (BINARY_WARMUP_MS + BINARY_STABLE_MS - 1) * 1000ULL);
+  }
+  runMs(PROBE_RESCAN_INTERVAL_MS + 100);  // nothing to choose from: the usual rescan
+  CHECK(phase() == ProbePhase::Scanning && probeStatus().scanIndex == 1);
+}
+
+// One module (A VCC, B OUT, C GND): its stable level never stops
+// discovery; after the whole cycle it is the only candidate, re-probed
+// from a fresh precheck and shown as an unverified Binary Digital Sensor.
+static void testBinaryTentativeCandidate() {
+  resetWithBinary();
+  binSim.attached = true;  // active-low: idle HIGH
+  CHECK(runUntil([] { return probeStatus().scanIndex == 3; }, 5000));
+  CHECK(probeStatus().candidateCount == 1 && !probeStatus().hasMapping && phase() == ProbePhase::Scanning);
+  CHECK(!probeSelectCandidate());  // never while discovery runs
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 30000));
+  CHECK(probeStatus().candidateSelected == 1 && collectSessions().count == PROBE_PERMUTATION_COUNT);
+  CHECK(allProbesPlainInput());  // the re-probe waits for its own precheck
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 2000));
+  CHECK(same(probeStatus().componentName, "Binary Digital Sensor"));
+  CHECK(probeStatus().evidence == EvidenceLevel::Candidate);
+  CHECK(sameRoles(probeStatus().mapping, outRoles(PROBE_PERMUTATIONS[0])));
+  char first[PROBE_MAPPING_TEXT_LEN];
+  char second[PROBE_MAPPING_TEXT_LEN];
+  formatProbeMapping(probeStatus().mapping, probeStatus().signalLabel, first, second, sizeof first);
+  CHECK(same(first, "A:VCC B:OUT") && same(second, "C:GND D:---"));
+  CHECK(same(probeStatus().telemetry1, "Level: HIGH (1)") && same(probeStatus().telemetry2, "Type: Digital IO"));
+  const SessionLog log = collectSessions();
+  CHECK(log.violations == 0 && log.count == PROBE_PERMUTATION_COUNT + 1);
+  CHECK(sessionPowers(log.s[PROBE_PERMUTATION_COUNT], PROBE_PERMUTATIONS[0]));
+  CHECK(log.s[PROBE_PERMUTATION_COUNT].endUs == UINT64_MAX);
+
+  // A constant output is valid monitoring: no failure, nothing to redraw.
+  const uint32_t rev = probeStatus().revision;
+  runMs(10000);
+  CHECK(phase() == ProbePhase::Detected && probeStatus().consecutiveFailures == 0 && !probeStatus().readingStale);
+  CHECK(probeStatus().revision == rev);
+
+  // Guided verification through the engine (Serial v, q, a, q).
+  const uint32_t window = BINARY_VERIFY_WINDOW_MS + 100;
+  CHECK(probeSendCommand('v') && probeSendCommand('q'));
+  runMs(window);
+  binSim.active = true;
+  CHECK(probeSendCommand('a'));
+  runMs(window);
+  binSim.active = false;
+  CHECK(probeSendCommand('q'));
+  runMs(window);
+  CHECK(probeStatus().evidence == EvidenceLevel::UserVerified);
+  CHECK(same(probeStatus().telemetry1, "State: IDLE (1)") && same(probeStatus().telemetry2, "Verified active-LOW"));
+  binSim.active = true;
+  runMs(100);
+  CHECK(same(probeStatus().telemetry1, "State: ACTIVE (0)"));
+
+  // Picking a mapping (here the only one again) is a new binding: the
+  // verification is gone and the mapping is rechecked before power.
+  CHECK(probeSelectCandidate());
+  CHECK(probeStatus().evidence == EvidenceLevel::None && !probeStatus().detected && allProbesPlainInput());
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 2000));
+  CHECK(probeStatus().evidence == EvidenceLevel::Candidate && same(probeStatus().telemetry1, "Level: LOW (0)"));
+
+  // Removal cannot be told from a static output: the floating line is
+  // still shown and nothing is inferred; only a clear forgets it.
+  binSim.active = false;
+  runMs(100);
+  CHECK(same(probeStatus().telemetry1, "Level: HIGH (1)"));
+  binSim.attached = false;
+  runMs(10000);
+  CHECK(phase() == ProbePhase::Detected && probeStatus().consecutiveFailures == 0);
+  CHECK(same(probeStatus().telemetry1, "Level: LOW (0)"));
+  CHECK(probeRequestClear());
+  CHECK(phase() == ProbePhase::Scanning && probeStatus().candidateCount == 0 && !probeStatus().hasMapping);
+  CHECK(probeStatus().evidence == EvidenceLevel::None);
+}
+
+// A wire from B to C clamps OUT to GND on four mappings (VCC on A or D,
+// OUT and GND on B and C): indistinguishable stable levels. No pinout is
+// picked: the cycle ends ambiguous and waits; each pick goes through the
+// normal precheck, and a pick never bypasses a veto.
+static void testBinaryAmbiguousMappings() {
+  resetWithBinary();
+  connect(1, 2, 1.0);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
+  CHECK(probeStatus().candidateCount == 4 && probeStatus().candidateSelected == 0);
+  CHECK(same(probeStatus().lastError, "ambiguous-mappings") && !probeStatus().hasMapping);
+  CHECK(probeStatus().evidence == EvidenceLevel::None);
+  const int expected[4] = {0, 4, 19, 23};
+  for (uint8_t i = 0; i < 4; i++) {
+    ProbeMapping m;
+    CHECK(probeCandidateMapping(i, m) && sameRoles(m, outRoles(PROBE_PERMUTATIONS[expected[i]])));
+  }
+  ProbeMapping none;
+  CHECK(!probeCandidateMapping(4, none));
+
+  // No rescan while the list waits.
+  const int sessions = collectSessions().count;
+  runMs(3 * PROBE_RESCAN_INTERVAL_MS);
+  CHECK(phase() == ProbePhase::NoComponent && collectSessions().count == sessions && allProbesPlainInput());
+
+  // 'n' picks the next one; it is powered only after its own precheck.
+  CHECK(probeSelectCandidate());
+  CHECK(probeStatus().candidateSelected == 1 && phase() == ProbePhase::Confirming && allProbesPlainInput());
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 2000));
+  CHECK(sameRoles(probeStatus().mapping, outRoles(PROBE_PERMUTATIONS[0])));
+  CHECK(probeStatus().evidence == EvidenceLevel::Candidate && same(probeStatus().telemetry1, "Level: LOW (0)"));
+  CHECK(probeSelectCandidate() && probeStatus().candidateSelected == 2);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 2000));
+  CHECK(sameRoles(probeStatus().mapping, outRoles(PROBE_PERMUTATIONS[4])));
+
+  // A short appears on A-D: candidate 1 (VCC A) is vetoed and never powered.
+  connect(0, 3, 1.0);
+  CHECK(probeSelectCandidate() && probeSelectCandidate() && probeSelectCandidate());  // 3, 4, then 1
+  CHECK(probeStatus().candidateSelected == 1);
+  const int before = collectSessions().count;
+  CHECK(runUntil([] { return probeStatus().consecutiveFailures == 1; }, 2000));
+  CHECK(same(probeStatus().lastError, "blocked-by-precheck") && same(probeStatus().evaluation.reason, "VCC coupling"));
+  CHECK(runUntil([] { return phase() == ProbePhase::Idle; }, 10000));  // three blocked retries: forgotten
+  CHECK(collectSessions().count == before && !probeStatus().hasMapping && allProbesPlainInput());
+
+  // A fresh cycle: candidates appear as it runs, but none can be picked
+  // before it ends.
+  connect(0, 3, kOpenOhms);
+  CHECK(probeRequestClear());
+  CHECK(runUntil([] { return probeStatus().candidateCount > 0; }, 5000));
+  CHECK(phase() == ProbePhase::Scanning && !probeSelectCandidate());
+}
+
+// Start-up pulses, toggling, and a millis() rollover.
+static void testBinaryStartupAndToggling() {
+  // A start-up pulse inside the observation is one more transition: still
+  // only a Candidate, polarity unknown (never taken from power-up levels).
+  resetWithBinary();
+  binSim.attached = true;
+  binSim.startupMs = 150;
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 30000));
+  CHECK(probeStatus().evidence == EvidenceLevel::Candidate && same(probeStatus().telemetry1, "Level: HIGH (1)"));
+
+  // Excessive toggling stays inconclusive: no candidate at all.
+  resetWithBinary();
+  binSim.attached = true;
+  binSim.toggleMs = 30;
+  CHECK(runUntil([] { return probeStatus().scanIndex == 2; }, 3000));
+  CHECK(same(probeStatus().lastError, "toggling"));
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
+  CHECK(probeStatus().candidateCount == 0 && !probeStatus().hasMapping);
+
+  // millis() wraps ~600 ms in, during the first attempts.
+  resetWithBinary((static_cast<uint64_t>(0xFFFFFFFFu) - 600) * 1000);
+  binSim.attached = true;
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 30000));
+  CHECK(millis() < 30000 && probeStatus().evidence == EvidenceLevel::Candidate);
+  CHECK(collectSessions().violations == 0);
+}
+
+// The existing vetoes hold for the binary driver: with A shorted to C,
+// mapping 1 (VCC A, GND C) is refused as VCC-GND coupling, and no mapping
+// with VCC on A or C is ever powered. The clamped mappings left over are
+// candidates only.
+static void testBinaryVetoes() {
+  resetWithBinary();
+  connect(0, 2, 1.0);
+  CHECK(runUntil([] { return probeStatus().evaluation.serial != 0; }, 1000));
+  CHECK(sameRoles(probeStatus().evaluation.mapping, outRoles(PROBE_PERMUTATIONS[0])));
+  CHECK(same(probeStatus().evaluation.reason, "VCC-GND coupling") && collectSessions().count == 0);
+  CHECK(runUntil([] { return phase() == ProbePhase::NoComponent; }, 30000));
+  const SessionLog log = collectSessions();
+  CHECK(log.violations == 0 && poweredSessions(log) == 12);  // VCC on B or D only
+  for (int i = 0; i < log.count; i++) CHECK(log.s[i].vcc == 1 || log.s[i].vcc == 3);
+  CHECK(probeStatus().candidateCount == 4 && probeStatus().evidence == EvidenceLevel::None);
+  CHECK(!probeStatus().hasMapping && allProbesPlainInput());
+}
+
+// An inconsistent precheck skips only that attempt (never powered); the
+// module on the next mapping is still found with fresh observations.
+static void testBinaryPrecheckSkip() {
+  resetWithBinary();
+  binSim.attached = true;
+  binSim.wiring = 1;  // C VCC, B OUT, A GND: attempt 2
+  flakyA = true;
+  CHECK(runUntil([] { return probeStatus().scanIndex == 2; }, 1000));
+  flakyA = false;
+  CHECK(probeStatus().inconclusiveCount == 1 && same(probeStatus().lastError, "precheck-inconsistent"));
+  CHECK(collectSessions().count == 0 && highDriveEvents == 0);  // attempt 1 was never powered
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 30000));
+  CHECK(sameRoles(probeStatus().mapping, outRoles(PROBE_PERMUTATIONS[1])));
+  CHECK(probeStatus().evidence == EvidenceLevel::Candidate && probeStatus().inconclusiveCount == 1);
+}
+
+// A later validated protocol response (here a fake four-wire driver on a
+// backend) supersedes a tentative binary candidate, and a confirmed result
+// is never preempted by one.
+static void testBinaryCandidateSuperseded() {
+  FakeDriver f(4, "Fake F", ProbeTopology::FourWirePowered, ExcitationPolicy::ProtectedActive);
+  f.acceptSlot = 5;
+  useDrivers(&binary, &f);
+  resetWorld(1000000ULL, kAllBackendCaps);
+  binSim.attached = true;
+  CHECK(runUntil([] { return probeStatus().scanIndex == PROBE_PERMUTATION_COUNT + 1; }, 30000));
+  CHECK(probeStatus().candidateCount == 1 && !probeStatus().hasMapping);  // tentative; the scan went on
+  CHECK(runUntil([] { return phase() == ProbePhase::Confirming; }, 10000));
+  CHECK(same(probeStatus().componentName, "Fake F") && probeStatus().evidence == EvidenceLevel::Validated);
+  CHECK(probeStatus().candidateCount == 0 && sameRoles(probeStatus().mapping, PROBE_FOUR_WIRE_MAPPINGS[5]));
+  CHECK(!probeSelectCandidate());  // nothing tentative left to pick
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 3000));
+  const int sessions = collectSessions().count;
+  runMs(5000);
+  CHECK(phase() == ProbePhase::Detected && same(probeStatus().componentName, "Fake F"));
+  CHECK(collectSessions().count == sessions);  // no binary attempt ran again
+}
+
 #endif  // PINDEX_POWERED_PROBING_ENABLED
 
 #if FULL_BUILD
@@ -3749,6 +4468,31 @@ static void testFourWirePrecheckVeto() {
   resetWorld();  // an empty socket, but no capabilities
   runMs(10000);
   CHECK(f.calls == 0 && backend.requests == 0 && probeStatus().precheck == PrecheckResult::NotRun);
+}
+
+// The production order (DHT11, I2C, binary, ultrasonic, passive): a DHT11
+// answers on its mapping before the binary driver ever runs there; and a
+// resistor stays a passive result whatever stable levels the binary driver
+// saw on the way (they stay selectable, never shown by themselves).
+static void testBinaryInProductionOrder() {
+  useDrivers(&dht, &i2c, &binary, &ultrasonic, &passive);
+  resetWorld();
+  sensor.attached = true;
+  sensor.wiring = PROBE_PERMUTATIONS[0];
+  CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
+  const int fourWire = PINDEX_I2C_GPIO_POWER_ENABLED ? PROBE_FOUR_WIRE_COUNT : 0;
+  CHECK(probeStatus().scanTotal == 2 * PROBE_PERMUTATION_COUNT + fourWire + PROBE_PAIR_COUNT);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
+  CHECK(same(probeStatus().componentName, "DHT11 Temp & Hum") && probeStatus().evidence == EvidenceLevel::Validated);
+  CHECK(probeStatus().candidateCount == 0 && collectSessions().count == 1 && senseCount == 0);
+
+  useDrivers(&binary, &passive);
+  resetWorld();
+  connect(1, 2, 10000);  // a resistor on B-C
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 40000));
+  CHECK(same(probeStatus().componentName, "Resistive Component") && sameRoles(probeStatus().mapping, PROBE_PAIRS[1]));
+  CHECK(probeStatus().evidence == EvidenceLevel::Validated && same(probeStatus().telemetry1, "R~ 10.0 kOhm"));
+  CHECK(probeStatus().candidateCount > 0 && probeStatus().candidateSelected == 0);
 }
 
 #endif  // FULL_BUILD
@@ -4032,6 +4776,18 @@ static void testPassiveOnlyBuild() {
     if (nodeOf(mock::events[i].pin) < 0) continue;
     CHECK(mock::events[i].mode != OUTPUT && mock::events[i].mode != (OUTPUT_OPEN_DRAIN | PULLUP));
   }
+
+  // The binary driver is three-wire powered: never run here, not "hardware
+  // required" either, and its module is never powered.
+  useDrivers(&binary, &passive);
+  resetWorld();
+  binSim.attached = true;
+  connect(2, 3, 10000);
+  CHECK(runUntil([] { return phase() == ProbePhase::Scanning; }, 100));
+  CHECK(probeStatus().scanTotal == PROBE_PAIR_COUNT && probeStatus().hardwareRequiredMask == 0);
+  CHECK(runUntil([] { return phase() == ProbePhase::Detected; }, 5000));
+  CHECK(same(probeStatus().componentName, "Resistive Component") && probeStatus().candidateCount == 0);
+  CHECK(highDriveEvents == 0 && !binSim.powered);
 }
 
 #endif
@@ -4043,7 +4799,7 @@ static void testDisabledNeverDrives() {
   FakeDriver t(2, "Fake T", ProbeTopology::TwoTerminal, ExcitationPolicy::WeakPullOnly);
   a.acceptSlot = 0;
   t.acceptSlot = 0;
-  useDrivers(&a, &t, &ultrasonic, &passive);
+  useDrivers(&a, &t, &ultrasonic, &passive, &binary);
   resetWorld(1000000ULL, kAllBackendCaps);  // not even a capable backend is used
   connect(0, 1, 10000);
   const uint32_t rev = probeStatus().revision;
@@ -4085,6 +4841,9 @@ int main() {
   testPassiveToDhtHandoff();
   testUltrasonicHandoff();
   testI2cHandoff();
+  testBinaryDriverContract();
+  testBinaryGuidedVerification();
+  testBinarySamplingLimits();
   testCouplingClassifier();
   testCouplingPolicy();
 #if PINDEX_POWERED_PROBING_ENABLED
@@ -4118,6 +4877,13 @@ int main() {
 #else
   testI2cNoGpioPower();
 #endif
+  testBinaryEmptyScan();
+  testBinaryTentativeCandidate();
+  testBinaryAmbiguousMappings();
+  testBinaryStartupAndToggling();
+  testBinaryVetoes();
+  testBinaryPrecheckSkip();
+  testBinaryCandidateSuperseded();
 #endif
 #if FULL_BUILD
   testTopologyEnumeration();
@@ -4129,6 +4895,7 @@ int main() {
   testI2cPrecheckVeto();
   testFourWirePriority();
   testPullupExceptionThenDhtAndPassive();
+  testBinaryInProductionOrder();
 #endif
 #if PINDEX_PASSIVE_PROBING_ENABLED
   testPassiveResistor();

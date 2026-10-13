@@ -4,9 +4,12 @@
 // first (three-wire, then four-wire), then two-terminal (passive)
 // interpretation; earlier entries go first within a topology, among the
 // drivers whose supply is eligible. This table keeps that order: DHT11,
-// I2C, ultrasonic, passive.
+// I2C, binary, ultrasonic, passive. Priority alone never lets the binary
+// driver's stable level outrank a protocol: it only reports Candidate
+// evidence, which the engine keeps tentative.
 #include "driver_registry.h"
 
+#include "binary_driver.h"
 #include "dht11_driver.h"
 #include "i2c_driver.h"
 #include "passive_driver.h"
@@ -17,12 +20,14 @@ namespace {
 // Live for the firmware's lifetime; never allocated.
 Dht11Driver dht11Driver;
 I2cDriver i2cDriver;
+BinaryDriver binaryDriver;  // the generic profile (config.h)
 UltrasonicDriver ultrasonicDriver;
 PassiveDriver passiveDriver;
 
 SensorDriver *const registeredDrivers[] = {
     &dht11Driver,
     &i2cDriver,
+    &binaryDriver,
     &ultrasonicDriver,
     &passiveDriver,
 };

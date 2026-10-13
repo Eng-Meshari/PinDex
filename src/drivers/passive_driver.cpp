@@ -31,6 +31,7 @@ const DriverRequirements kRequirements = {
     SupplyProfile::None,             // supply: nothing is powered
     true,                            // openDrainSignals: sink only, never HIGH
     {nullptr, nullptr},              // signalLabel
+    false,                           // dataIsOutput: three-wire only
 };
 
 const size_t kTextLen = 24;

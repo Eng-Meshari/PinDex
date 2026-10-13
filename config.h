@@ -167,6 +167,22 @@
 #define I2C_FIRST_ADDRESS 0x08            // scan range, inclusive (0x00-0x07 and 0x78-0x7F are
 #define I2C_LAST_ADDRESS 0x77             // reserved and never addressed)
 
+// Binary digital sensor driver (src/drivers/binary_driver.cpp): the generic
+// discovery profile. Provisional engineering choices, NOT validated on
+// hardware or against any module's datasheet. A module that needs a longer
+// warm-up (e.g. a PIR) is verified in the guided mode after waiting, rather
+// than by lengthening every one of the 24 discovery attempts.
+#define BINARY_WARMUP_MS 100UL           // OUT bias applied -> first counted sample
+#define BINARY_SAMPLE_INTERVAL_MS 10UL   // probe sampling and monitoring cadence
+#define BINARY_STABLE_MS 200UL           // a level must hold this long before it is a candidate
+#define BINARY_DEBOUNCE_MS 20UL          // monitoring: a new level is shown after holding this long
+#define BINARY_MAX_OBSERVE_MS 1000UL     // per attempt, after warm-up: no stable level -> inconclusive
+#define BINARY_MAX_TRANSITIONS 4         // more changes in one observation: toggling, inconclusive
+#define BINARY_BIAS_SETTLE_MS 10UL       // floating check: after each pull change, before reading
+#define BINARY_VERIFY_WINDOW_MS 500UL    // guided: stable level needed after each mark
+#define BINARY_VERIFY_TIMEOUT_MS 5000UL  // guided: that window must complete within this
+#define BINARY_MESSAGE_MS 3000UL         // guided: a result message stays shown this long
+
 // Supported DHT11 profile: plausibility window for decoded values.
 #define DHT11_HUMIDITY_MIN_PCT 5
 #define DHT11_HUMIDITY_MAX_PCT 95

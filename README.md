@@ -4,7 +4,7 @@
 labs. The goal is to let students insert a component or sensor module, have
 it identified, and get its pinout.
 
-> **Status: v0.2 + Phase 5.** A four-node socket (A, B, C, D) and four
+> **Status: v0.2 + Phase 6.** A four-node socket (A, B, C, D) and five
 > drivers sit behind a generic probe engine, in this priority order:
 > - DHT11-compatible detection with pinout and live telemetry (three-wire,
 >   powered from GPIOs);
@@ -13,6 +13,11 @@ it identified, and get its pinout.
 >   3.3 V four-wire interface that does not exist yet, or the explicitly
 >   enabled *experimental* GPIO power profile (off by default). See
 >   [I2C scanner](#i2c-scanner-four-wire);
+> - a binary digital-output driver (three-wire, powered from GPIOs). A
+>   driven, stable logic level only makes a mapping a **tentative
+>   candidate**, never an identification; a guided test with the real
+>   stimulus can verify the response and its polarity. See
+>   [Binary digital sensors](#binary-digital-sensors-three-wire);
 > - HC-SR04-compatible ultrasonic distance (four-wire, 5 V). Fully
 >   implemented and tested in simulation, but **not attempted on this
 >   board**: it needs a protected 5 V interface that does not exist yet
@@ -41,13 +46,14 @@ it identified, and get its pinout.
 
 | File | Purpose |
 |---|---|
-| `PinDex.ino` | Sketch entry point: startup order, screen updates, Serial heartbeat and Serial commands (`r`, `c`, driver commands). |
+| `PinDex.ino` | Sketch entry point: startup order, screen updates, Serial heartbeat and Serial commands (`r`, `c`, `i`, `n`, driver commands). |
 | `config.h` | All pins, timings, thresholds, failure limits and the three probing settings. |
 | `display_manager.h/.cpp` | VSPI + SSD1306 setup; renders the engine's status snapshot (splash, idle, status, result screens). |
 | `probe_engine.h/.cpp` | Generic orchestrator: owns the node table and probe GPIOs, the mapping tables, precheck routing, power sequencing (GPIO or four-wire backend), capability-based attempt scheduling, confirmation, monitoring and removal. Knows no concrete sensor. |
 | `four_wire_backend.h/.cpp` | The protected four-wire power/routing interface seam. The shipped implementation reports **no capabilities** and refuses every connection, because no such hardware exists yet. |
-| `sensor_driver.h` | The abstract `SensorDriver` contract: operation status, `DriverRequirements` (topology, excitation, supply profile, open-drain signals), `ProbeContext`, optional release/diagnostics hooks. |
+| `sensor_driver.h` | The abstract `SensorDriver` contract: operation status, `DriverRequirements` (topology, excitation, supply profile, open-drain signals, output-only DATA), `ProbeContext`, `EvidenceLevel`, optional release/diagnostics hooks. |
 | `src/drivers/dht11_driver.h/.cpp` | `Dht11Driver`: DHT start pulse, bounded capture, validation and telemetry formatting. |
+| `src/drivers/binary_driver.h/.cpp` | `BinaryDriver`: input profile, warm-up, polled observation, floating check, candidate evidence, monitoring and the guided verification. |
 | `src/drivers/ultrasonic_driver.h/.cpp` | `UltrasonicDriver`: HC-SR04 trigger pulse, interrupt-timestamped echo capture, validation, confirmation and telemetry. |
 | `src/drivers/i2c_driver.h/.cpp` | `I2cDriver`: incremental 0x08–0x77 address sweeps, two-sweep confirmation, round-robin liveness checks, address hints. |
 | `src/drivers/i2c_bus.h/.cpp` | The only I2C controller code: exclusive owner of `Wire1`, return-code mapping, idle-line checks, release. |
@@ -56,7 +62,7 @@ it identified, and get its pinout.
 | `src/drivers/passive_adc.h/.cpp` | The only ADC code: ESP-IDF oneshot ADC (both ADC units) with pull-up control and error checking. |
 | `src/drivers/driver_registry.h/.cpp` | The static driver table (priority order) and its read-only API. |
 | `dht11.h/.cpp` | Pure DHT11 frame decoding (timing → bits → bytes → values); no GPIO, host-testable. |
-| `tests/` | Host-side tests with a mock Arduino layer (incl. interrupts), fake drivers, a resistor-network simulator, a simulated ADC, a simulated DHT11, a fake protected four-wire backend, a simulated HC-SR04 and a simulated I2C bus and module. Not compiled by the Arduino IDE. |
+| `tests/` | Host-side tests with a mock Arduino layer (incl. interrupts), fake drivers, a resistor-network simulator, a simulated ADC, a simulated DHT11, a simulated binary output module, a fake protected four-wire backend, a simulated HC-SR04 and a simulated I2C bus and module. Not compiled by the Arduino IDE. |
 | `README.md` | This document. |
 | `.gitignore` | Keeps build output and editor/OS files out of version control. |
 
@@ -131,7 +137,7 @@ are powered according to the driver's **supply profile**
 
 | Profile | Used by | Powered by |
 |---|---|---|
-| `GpioLogic` | DHT11 (three-wire) | GPIO VCC HIGH / GND LOW, as above |
+| `GpioLogic` | DHT11, binary digital sensor (three-wire) | GPIO VCC HIGH / GND LOW, as above |
 | `Backend5V` | HC-SR04 | The protected four-wire backend's switched 5 V **only**. Never GPIOs. |
 | `Supply3V3` | I2C scanner | The protected backend's switched 3.3 V if it reports it; otherwise **only** the experimental GPIO profile, and only when `PINDEX_I2C_GPIO_POWER_ENABLED` is `1` |
 | `None` | Passive | Nothing |
@@ -180,7 +186,9 @@ if its supply profile and the safety policy permit it.
 **GPIO power-up** (three-wire, and the experimental four-wire I2C
 profile): every node plain `INPUT` and the backend off first, then GND
 driven LOW, then VCC driven HIGH; three-wire DATA as `INPUT_PULLUP`; the
-other nodes stay plain `INPUT`. On the ESP32 core 3.x, `digitalWrite()`
+other nodes stay plain `INPUT`. A driver whose DATA is the module's
+output (`dataIsOutput`, the binary driver) gets no engine pull-up: that
+node is shown as `OUT` and the driver picks its own input bias. On the ESP32 core 3.x, `digitalWrite()`
 before `pinMode(OUTPUT)` sets the output latch first, so a pin never
 briefly drives the opposite level.
 
@@ -599,6 +607,192 @@ the three-wire attempts, and its first liveness sample (and the result
 screen) follows 2 s later. In the simulation each pass is 1 ms; on
 hardware a pass is usually faster, so sweeps are shorter.
 
+## Binary digital sensors (three-wire)
+
+Implemented by `BinaryDriver` (`src/drivers/binary_driver.cpp`) for
+three-terminal modules with one digital output: VCC, OUT, GND, on any 3
+of the 4 nodes (the same 24 mappings as the DHT11). The result is always
+called **Binary Digital Sensor**. Two logic states never make PinDex call
+a part an IR, PIR, flame, sound or touch sensor.
+
+### Electrical scope
+
+- **Profile:** `ThreeWirePowered` + `ProtectedActive` + the existing
+  `GpioLogic` supply: the engine drives GND LOW and VCC HIGH from probe
+  GPIOs (nominal 3.3 V, not a regulated rail) behind the protected
+  interface, exactly as for the DHT11. The driver never touches VCC or GND.
+  The fourth node stays plain `INPUT`.
+- **OUT is only ever an input:** plain `INPUT` by default, or the internal
+  weak pull-up when selected. It is never `OUTPUT`, DAC or PWM, never sunk,
+  and the engine adds no pull-up to it (`DriverRequirements::dataIsOutput`).
+- **Eligibility is unchanged:** `PINDEX_POWERED_PROBING_ENABLED` gates it
+  like any powered driver; with powered probing off it never runs. The
+  profile name is not evidence that the interface protects anything.
+- **Vetoes are unchanged:** a mapping whose VCC node the precheck sees
+  coupled to anything (VCC–GND included) is never powered. Many breakouts
+  have a pull-up resistor or an indicator LED from OUT to VCC, or a trimpot
+  across VCC–GND; the precheck can see those as VCC coupling, which blocks
+  their correct mapping. That veto is intended; no exception exists for
+  this driver.
+- **Supported modules:** only modules whose **complete breakout** (sensor,
+  emitter, LEDs, regulator, start-up current, output voltage) works from
+  the GPIO 3.3 V profile and tolerates every wrong assignment the scan
+  makes. Many IR, PIR, sound, flame and touch boards need 5 V, draw more
+  current than a GPIO can source, or drive OUT above 3.3 V. Those are
+  **not supported**, and nothing here powers anything at another voltage.
+
+### Discovery: tentative candidates only
+
+After the engine powers a mapping, each `probe()`:
+
+1. sets OUT to the profile's bias (plain `INPUT` by default);
+2. waits `BINARY_WARMUP_MS` (100 ms) without sampling, so power-up and
+   bias-change edges are never evidence;
+3. samples every `BINARY_SAMPLE_INTERVAL_MS` (10 ms), tracking the raw
+   level, how long it has held, and transitions. A level that holds for
+   `BINARY_STABLE_MS` (200 ms) ends the observation. More than
+   `BINARY_MAX_TRANSITIONS` (4) changes is `toggling`, and no stable level
+   within `BINARY_MAX_OBSERVE_MS` (1 s) is `no-stable-level`. Both are
+   inconclusive, never a candidate;
+4. runs a bounded **floating check**, once: the weak pull *opposing* the
+   stable level for `BINARY_BIAS_SETTLE_MS` (10 ms) and one read, then the
+   profile's bias again for 10 ms and one read. Only those two reads are
+   taken under the change. A line that follows either pull is floating or
+   only weakly held (`follows-bias`): no evidence;
+5. reports `EvidenceLevel::Candidate`.
+
+These are provisional engineering values, not validated on hardware. A
+module with a long warm-up (e.g. a PIR) is handled in the guided mode,
+where you wait as long as it needs, instead of lengthening every one of
+the 24 attempts. A module-specific `BinaryProfile` (warm-up, sampling,
+stable window, debounce, observation budget, bias, polarity) can be passed
+to the driver's constructor; registering one with a long warm-up makes
+every three-wire mapping wait that long.
+
+**What a candidate does not prove.** A stable, driven level does not show
+a valid input voltage, an actively driven output, correct supply polarity,
+the right OUT node or any model. A wire clamping OUT to GND passes the
+floating check exactly like a real output, and a healthy open-collector
+output is allowed to sink strongly to one rail. No powered impedance test
+tries to resolve this. A released open-collector output without its own
+pull-up is indistinguishable from a floating wire: it only becomes a
+candidate if it is asserted (sinking) during the scan, or with a pull-up
+profile.
+
+**Priority.** The registry order is DHT11, I2C, binary, ultrasonic,
+passive. That order alone never lets a stable level outrank a protocol:
+
+- a candidate never stops discovery. Its attempt is torn down and
+  remembered (at most 24 per cycle), and every other eligible attempt
+  still runs;
+- any later validated response (DHT frame, I2C ACK sweeps, ultrasonic
+  echoes) supersedes every candidate. A confirmed result is never
+  preempted: no discovery runs while it is monitored;
+- a single passive pair still wins over candidates at the end of the
+  cycle; the candidates stay selectable with `n`, but are not shown;
+- otherwise, **one** candidate is re-probed (fresh power-off wait,
+  precheck and vetoes) and shown with *LIVE UNVERIFIED*;
+- **several** candidates are reported as ambiguous: *N possible pinouts /
+  Send 'n' to select*, `err=ambiguous-mappings`, and one Serial line per
+  candidate. No mapping is picked, and the engine waits (no automatic
+  rescan) until you pick one or clear.
+
+### Picking a candidate (`n`)
+
+`n` picks the next candidate of the latest cycle (1, 2, … then back to 1).
+It is refused while discovery runs. A pick releases whatever is running,
+then the mapping goes through the normal path: 300 ms off, a fresh
+precheck, every veto, and `probe()` again before anything is powered or
+shown. A pick that is now vetoed counts as a failed acquisition and is
+never powered; three in a row forget it. The status bar shows the pick as
+*LIVE UNVERIFIED 2/4*.
+
+### Guided verification (Serial `v`, `q`, `a`)
+
+With a binary candidate shown (detected), use the real stimulus (hand,
+flame, sound, touch, …):
+
+1. **`v`**: start (or cancel). *No stimulus, send q*.
+2. Remove the stimulus, send **`q`**: the level must then hold for
+   `BINARY_VERIFY_WINDOW_MS` (500 ms) within `BINARY_VERIFY_TIMEOUT_MS`
+   (5 s), else *Verify: unsteady* and that step is redone.
+3. Apply the stimulus, send **`a`**: the same window. It must differ from
+   the idle level, else *Verify: no change* (inconclusive).
+4. Remove it, send **`q`**: the level must return to the idle level, else
+   *Verify: no return* (inconclusive).
+
+Only then is the result **user-verified** (*LIVE USER VERIFIED*) and the
+**polarity** set from the marked phases: active LOW → active-low, active
+HIGH → active-high. The level seen at power-up is never used. The result
+belongs to this mapping and this binding: picking a mapping, clearing,
+any retry or re-probe, or starting a new `v` session discards it. It
+supports the selected mapping under the tested conditions only; it does
+not prove a model or rule out every wiring error.
+
+**`p`** toggles the weak pull-up on OUT for this binding (for an open
+collector without its own pull-up). It restarts any session, and samples
+are discarded for 10 ms so the change is never an edge. It is not a
+"sensor override": a strong output still wins over the internal pull-up.
+
+### Monitoring and display
+
+`readSample()` takes one new sample per call (every 10 ms). The raw level
+and its interpretation are kept apart:
+
+| Polarity | Shown | Example |
+|---|---|---|
+| Unknown (default) | the raw level | `Level: HIGH (1)` |
+| Active-low (verified, or from a profile) | state + raw | `State: ACTIVE (0)`, `State: IDLE (1)` |
+| Active-high | state + raw | `State: ACTIVE (1)`, `State: IDLE (0)` |
+
+```text
+Binary Digital Sensor
+State: ACTIVE (0)
+Type: Digital IO
+A:VCC B:OUT
+C:GND D:---
+LIVE USER VERIFIED
+```
+
+A tentative result reads *LIVE UNVERIFIED* (or *LIVE UNVERIFIED n/N*
+when picked from several). During a session line 2 shows the prompt. `i`
+prints `OUT raw=… (for … ms) shown=… edges=… bias=… polarity=…` from
+cached samples. A constant HIGH or LOW is a valid state: it is never a
+failure and never counts toward removal.
+
+### Sampling limits
+
+This is polling, not edge capture, and not lossless:
+
+- a pulse shorter than the 10 ms sample interval can be missed entirely;
+- a new level is shown only once samples at least `BINARY_DEBOUNCE_MS`
+  (20 ms) apart agree, so pulses shorter than about 20–30 ms are counted
+  as edges (`i`) but not shown;
+- the loop's other work (display redraws, Serial) can stretch the
+  interval further.
+
+Support is limited to signals that stay at a level for at least
+~30 ms, e.g. a PIR or obstacle output. A sound module's short pulses are
+largely not observable here. No interrupt is used, so nothing has to be
+detached at teardown.
+
+### Removal and clearing
+
+A disconnected OUT can keep a stable level through the bias or leakage,
+so monitoring cannot tell removal from a static output, and it infers
+nothing: the last level stays on screen. Send **`c`** to clear and rescan
+after removing or swapping a module. On a clear, pick, retry, fault or
+reset the driver stops sampling, drops any session and verification, and
+removes its pull; the engine then removes power and returns every node to
+plain `INPUT`. Nothing reported before that is published again.
+
+### Timing
+
+Each binary attempt takes about 0.75 s (140 ms precheck, 100 ms warm-up,
+200 ms stable window, 20 ms floating check, 300 ms off); its 24 attempts
+add about 18 s to every discovery cycle. A noisy line ends earlier
+(`toggling`); a level that never settles takes up to 1.1 s.
+
 ## HC-SR04 ultrasonic (four-wire)
 
 Implemented by `UltrasonicDriver` (`src/drivers/ultrasonic_driver.cpp`),
@@ -917,7 +1111,7 @@ ever runs, and the Serial heartbeat continues once per second.
 **Scan cycle:** one cycle runs these attempts in order, each preceded by
 the precheck:
 1. every three-wire attempt (24 mappings), mapping-major, for drivers in
-   registry order;
+   registry order (DHT11, then binary, on each mapping);
 2. every four-wire attempt (24 mappings), mapping-major, I2C before
    ultrasonic, only for drivers with an eligible supply profile (none as
    shipped);
@@ -926,10 +1120,11 @@ the precheck:
 Powered attempts are skipped when powered probing is off or the precheck
 blocks that mapping; four-wire drivers without an eligible supply are
 left out of the cycle entirely; passive attempts are skipped
-when passive probing is off. The screen shows *Scanning n/m*: m = 30 as
-shipped (24 + 6), plus 24 for each four-wire driver with an eligible supply
-(54 with one, 78 with both). An active match
-ends the cycle before any passive attempt.
+when passive probing is off. The screen shows *Scanning n/m*: m = 54 as
+shipped (24 DHT11 + 24 binary + 6), plus 24 for each four-wire driver with
+an eligible supply (78 with one, 102 with both). A validated active match
+ends the cycle before any passive attempt; a binary candidate never does
+(see [Binary digital sensors](#binary-digital-sensors-three-wire)).
 
 **With powered probing enabled**, the DHT11 driver behaves as follows:
 
@@ -987,8 +1182,9 @@ handling is unchanged by them.
 
 **Serial commands:** `r` clears a latched internal fault; `c` clears the
 current result and rescans; `i` prints the detected driver's diagnostics
-(the I2C scanner's full address list). Any other letter goes to the
-detected driver (the passive driver uses `l`, `d` and `b`).
+(the I2C scanner's full address list); `n` picks the next tentative binary
+candidate. Any other letter goes to the detected driver (the passive
+driver uses `l`, `d` and `b`; the binary driver `v`, `q`, `a` and `p`).
 
 The splash is drawn once at boot. When it expires the screen follows the
 probe status, so the splash can never overwrite a result or a fault.
@@ -1002,9 +1198,11 @@ plus the heartbeat `heartbeat uptime=12s display=ok probe=detected`.
 | Event | Approximate time |
 |---|---|
 | One failed three-wire mapping (140 ms precheck + 1100 ms + start + 300 ms off) | 1.56 s |
-| Full empty-socket scan, as shipped (24 three-wire + 6 pairs) | ≈ 40 s, then 5 s idle |
-| First valid DHT frame at three-wire entry *k* | 1.26 s + (*k* − 1) × 1.56 s |
-| Confirmed DHT result | the above + 2.1 s (≈ 3.4 s for entry 1, ≈ 11.2 s for entry 6, ≈ 39 s for entry 24) |
+| One binary attempt (140 ms precheck + 100 ms warm-up + 200 ms stable + 20 ms check + 300 ms off) | ≈ 0.75 s |
+| Full empty-socket scan, as shipped (24 DHT11 + 24 binary + 6 pairs) | ≈ 58 s, then 5 s idle |
+| First valid DHT frame at three-wire entry *k* | 1.26 s + (*k* − 1) × 2.31 s (each earlier mapping also has its binary attempt) |
+| Confirmed DHT result | the above + 2.1 s (≈ 3.4 s for entry 1, ≈ 15 s for entry 6, ≈ 57 s for entry 24) |
+| Tentative binary result (one candidate) | the whole cycle + ≈ 0.8 s re-probe |
 | Removal inferred after extraction | ≈ 4.5–6.6 s |
 | One failed ultrasonic mapping (with a backend: precheck + 200 ms + 25 ms deadline + 300 ms off) | ≈ 0.67 s |
 | One empty I2C mapping (with an eligible supply: precheck + 100 ms + one sweep + 300 ms off) | ≈ 0.66 s |
@@ -1014,6 +1212,11 @@ plus the heartbeat `heartbeat uptime=12s display=ok probe=detected`.
 5 ms / 2 ms) add about 0.1 s to every attempt, ≈ 5 s over a 54-attempt
 cycle. An attempt skipped as inconclusive takes about 75 ms (three
 passes, each stopped at its first changed sample).
+
+**Phase 6 latency cost:** the binary driver adds one ≈ 0.75 s attempt to
+each three-wire mapping, ≈ 18 s per cycle, and a DHT11 on entry *k* is
+found about (*k* − 1) × 0.75 s later than before. A binary candidate
+always waits for the whole cycle before it is shown.
 
 **Phase 4 latency cost:** the D node quadruples the three-wire mappings
 (6 → 24), so an empty-socket cycle grew from about 8.4 s to about 37.5 s.
@@ -1116,11 +1319,23 @@ driver reset afterwards.)
   - **openDrainSignals**: the signal/DATA nodes are only released or sunk;
     if false, any coupling on a signal vetoes the mapping;
   - **signalLabel** (four-wire): display names for SIG1/SIG2, e.g.
-    `TRG`/`ECH`, `SDA`/`SCL` (default `S1`/`S2`).
+    `TRG`/`ECH`, `SDA`/`SCL` (default `S1`/`S2`);
+  - **dataIsOutput** (three-wire): DATA is the module's output and only
+    ever read. The engine adds no pull-up, gives the node the `OUT` role
+    (`NodeRole::Out`, shown as `OUT`) and passes it as `powered.data`.
+    `NodeRole::Data` (`DAT`) is unchanged for the DHT11.
+- **Evidence:** `evidence()` (default `Validated`) says what the latest
+  success shows. A discovery success reporting `Candidate` never stops the
+  scan; such results are judged over the whole cycle (one is shown as
+  tentative, several are ambiguous) and any `Validated` success replaces
+  them. `UserVerified` is a candidate the user confirmed in a guided test.
+  `ProbeStatus::evidence`, `candidateCount` and `candidateSelected` carry
+  this to the display; `probeSelectCandidate()` and
+  `probeCandidateMapping()` back Serial `n` and the candidate list.
 - **Attempt order:** within a cycle, `ThreeWirePowered`, then
   `FourWirePowered`, then `TwoTerminal`. Registry order applies within a
-  topology. Two-terminal successes are judged over all pairs before one
-  becomes the candidate.
+  topology. Two-terminal successes are judged over all pairs, and
+  candidates over the whole cycle, before one becomes the saved result.
 - `getName()` returns a static string used as the result title. It may
   change as a driver's classification evolves, and the engine re-reads it
   on every sample.
@@ -1148,8 +1363,8 @@ driver reset afterwards.)
    `registeredDrivers[]`. Earlier entries are tried first within the same
    topology, among drivers with an eligible supply. Drivers are static,
    never allocated. The current order is `Dht11Driver`, `I2cDriver`,
-   `UltrasonicDriver`, `PassiveDriver`, which matches the engine's
-   topology order.
+   `BinaryDriver`, `UltrasonicDriver`, `PassiveDriver`. Priority only
+   orders attempts; it never turns `Candidate` evidence into a result.
 
 No engine or display change is needed. Add tests with the mock in
 `tests/` before trying the driver on hardware.
@@ -1159,7 +1374,8 @@ No engine or display change is needed. Add tests with the mock in
 Three topologies exist on the four-node socket:
 - **`ThreeWirePowered`:** VCC/DATA/GND over 24 mappings, powered
   GND-first from GPIOs; the fourth node stays plain `INPUT`. Suits
-  three-pin, single-data-line sensors that tolerate that policy.
+  three-pin, single-data-line sensors that tolerate that policy (the
+  DHT11 protocol, and binary digital outputs as candidates).
 - **`FourWirePowered`:** VCC/SIG1/SIG2/GND over 24 mappings, powered by a
   protected backend that reports its capabilities (or, for the 3.3 V I2C
   profile only, the experimental GPIO path). Suits four-pin, two-signal
@@ -1177,6 +1393,26 @@ Not supported:
 Such families need a new topology or excitation value and a matching
 engine policy, not branches inside the state machine. No such driver is
 implemented.
+
+### Phase 6 changes to existing behaviour
+
+- A fifth driver, `BinaryDriver`, sits between the I2C scanner and the
+  ultrasonic driver. Every three-wire mapping gets a second attempt, so a
+  cycle is about 18 s longer and *Scanning n/m* counts 24 more.
+- `DriverRequirements` gains `dataIsOutput` (false for the existing
+  drivers), `SensorDriver` gains `evidence()` (default `Validated`, so
+  existing drivers behave as before), and `NodeRole` gains `Out`.
+- `ProbeStatus` gains `evidence`, `candidateCount` and
+  `candidateSelected`; the result screen's status bar reads *LIVE
+  UNVERIFIED* / *LIVE USER VERIFIED* for binary results and *LIVE*
+  otherwise, as before.
+- A cycle that ends with several candidates waits (*N possible pinouts*)
+  instead of rescanning after 5 s, until `n` or `c`. A three-node
+  resistor network that used to end as `ambiguous-pairs` and rescan can
+  now end this way too, because clamped mappings look like candidates.
+- New Serial commands: `n` (engine), `v`, `q`, `a`, `p` (binary driver).
+- DHT11, I2C, ultrasonic and passive timing, validation and failure
+  handling are unchanged; only their position in a longer cycle moves.
 
 ### Phase 5 changes to existing behaviour
 
@@ -1290,7 +1526,7 @@ Passive probing is controlled separately by
 
 ## Host tests
 
-`tests/test_pindex.cpp` exercises the probe engine and all four driver
+`tests/test_pindex.cpp` exercises the probe engine and all five driver
 contracts against these simulations:
 - `tests/mock/Arduino.h`: simulated GPIO, clock, critical sections and
   pin interrupts (`attachInterruptArg`/`detachInterrupt`; tests deliver
@@ -1299,6 +1535,9 @@ contracts against these simulations:
   and the simulated ADC;
 - a simulated DHT11 and a simulated HC-SR04 (TRIG/ECHO timing, stuck
   levels, missing echoes, TRIG coupling);
+- a simulated binary output module: powered only on its own VCC/GND,
+  push-pull or open collector, either polarity, a stimulus, a start-up
+  pulse and self-toggling;
 - a **fake** protected four-wire backend that records every connection and
   its supply voltage, and flags any made without a break, with a GPIO
   driven, with an interrupt attached or without the capabilities. It
@@ -1310,6 +1549,29 @@ contracts against these simulations:
   a stop, and flags two transactions in one loop pass, a transaction in a
   critical section, or supply removed while the controller still runs;
 - fake drivers that exercise the architecture.
+
+Coverage added in Phase 6 (binary driver) includes:
+- the module on each of the 24 mappings: a Candidate only after warm-up,
+  the stable window and the floating check, OUT only ever an input, the
+  fourth node untouched; all 24 attempted in table order through the
+  engine, with no engine pull-up on OUT;
+- floating, bias-following and rail-clamped inputs (never more than a
+  Candidate), released and asserted open collectors, `p`;
+- start-up pulses, toggling, a level that never settles, the observation
+  budget, and `millis()` rollover in the driver and the engine;
+- one candidate never stopping the scan, then shown tentative; four
+  clamped mappings ending ambiguous and held without a rescan; picks
+  through the precheck; a pick vetoed by a new short and never powered;
+  the VCC–GND veto; an inconclusive precheck skipping only its attempt;
+- a later validated (fake four-wire) response superseding a candidate,
+  no preemption of a confirmed result, the DHT11 first in the production
+  order, a passive resistor not overridden;
+- guided verification, active-low and active-high, no change, no
+  return, unsteady windows, a new binding or session discarding it, a
+  profile polarity; raw level with unknown polarity; constant output as
+  valid monitoring; missed and debounced pulses; reset mid-warm-up and
+  mid-check removing every pull with nothing republished; text widths;
+- the driver never run with powered probing off.
 
 Coverage added for the pull-up exception includes:
 - the classifier: 4.7k and 10k, internal pull-up spread, near-zero in
@@ -1383,7 +1645,7 @@ it and against the core sources, not by these tests. The tests need a
 host C++17 compiler (not the ESP32 toolchain). From the `PinDex` folder:
 
 ```text
-SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp src/drivers/weak_pull_meter.cpp"
+SRC="tests/test_pindex.cpp probe_engine.cpp dht11.cpp src/drivers/dht11_driver.cpp src/drivers/passive_driver.cpp src/drivers/ultrasonic_driver.cpp src/drivers/i2c_driver.cpp src/drivers/weak_pull_meter.cpp src/drivers/binary_driver.cpp"
 F="-std=c++17 -Wall -Wextra -Itests/mock -I."
 g++ $F -DPINDEX_POWERED_PROBING_ENABLED=1 -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=0 $SRC -o build/test_all
 g++ $F -DPINDEX_POWERED_PROBING_ENABLED=1 -DPINDEX_PASSIVE_PROBING_ENABLED=1 -DPINDEX_I2C_GPIO_POWER_ENABLED=1 $SRC -o build/test_i2c_gpio
@@ -1406,7 +1668,8 @@ the first unexpected result.
    it reviewed. Confirm the chosen DHT11 module is specified for about 3.3V.
 3. **Empty socket, powered build:** enable the setting, connect the probes
    only through the interface and leave the socket empty. Expect precheck
-   `no-obvious-coupling`, *Scanning 1/30 … 30/30* (about 37 s),
+   `no-obvious-coupling`, *Scanning 1/54 … 54/54* (about 58 s; binary
+   attempts end `follows-bias`),
    *No Component / Unknown*, the boot line about the ultrasonic needing
    hardware, and a rescan after 5 s.
 
@@ -1489,7 +1752,7 @@ bare ESP32 GPIO.
     fitted, that for every one of the 24 mappings: 5 V appears only on the
     VCC node, ground only on the GND node, no probe GPIO ever sees more
     than 3.3 V, and every route opens before the next mapping closes.
-15. **Empty socket:** expect *Scanning n/54* (n/78 if the I2C scanner is also eligible), no `hw-required=[HC-SR04 Ultrasonic]`, every
+15. **Empty socket:** expect *Scanning n/78* (n/102 if the I2C scanner is also eligible), no `hw-required=[HC-SR04 Ultrasonic]`, every
     four-wire attempt ending `no-echo`, and the supply off between
     attempts and while idle.
 16. **Known-good HC-SR04, mapping 1:** A = VCC, B = TRIG, C = ECHO, D =
@@ -1519,7 +1782,7 @@ elsewhere.
 
 20. **Default build:** with `PINDEX_I2C_GPIO_POWER_ENABLED 0` and no
     backend, confirm the boot line `I2C Device: hardware required ...`,
-    `hw-required=[I2C Device]` on status lines, *Scanning n/30*, and with
+    `hw-required=[I2C Device]` on status lines, *Scanning n/54*, and with
     a meter that no probe ever goes HIGH during the four-wire part of the
     cycle (there is none).
 21. **Evaluate the module first:** its supply current including LEDs,
@@ -1551,6 +1814,42 @@ elsewhere.
 27. **Validate `I2C_POWER_STABILIZE_MS`** (100 ms) for the module: the
     first sweep after power-on must already return the full address set.
 28. **Handoff:** repeat steps 4 and 8; DHT11 and passive results must be
+    unchanged.
+
+### Binary digital sensor bench steps
+
+Nothing here has been run on hardware. Use powered probing behind the
+reviewed interface only, and only a module evaluated first: it must run
+from about 3.3 V (sensor, emitter, LEDs, regulator, start-up current),
+drive OUT no higher than 3.3 V, and tolerate the wrong assignments the
+scan makes. If any of that is unknown, stop.
+
+29. **Empty socket:** with a scope on each node, confirm that during each
+    binary attempt OUT is never driven (only the weak pulls of the
+    floating check, about 300 ms after power-up, 10 ms each), the fourth
+    node stays high impedance, and no pull is left after teardown.
+30. **Known module, mapping 1:** A = VCC, B = OUT, C = GND, stimulus
+    absent. Expect the scan to run to the end, then *Binary Digital
+    Sensor*, `Level: …`, `A:VCC B:OUT` / `C:GND D:---` and *LIVE
+    UNVERIFIED*. If its VCC mapping is skipped (`coupled=` names its VCC
+    pair), an onboard pull-up, LED or trimpot is seen as VCC coupling;
+    that veto is intended.
+31. **Ambiguity:** if several pinouts are listed, pick each with `n` and
+    run step 32 on each; do not trust the first one.
+32. **Guided verification:** wait for the module's own warm-up (a PIR can
+    need tens of seconds), then `v`, remove the stimulus, `q`, apply it,
+    `a`, remove it, `q`. Expect *Verified active-LOW/HIGH* and
+    `State: ACTIVE (0/1)` that follows your hand. Repeat with no stimulus
+    on `a` to see *Verify: no change*.
+33. **Pulses:** measure the module's shortest output pulse with a scope;
+    pulses under about 30 ms are not shown reliably (see *Sampling
+    limits*).
+34. **Validate the provisional values** (`BINARY_WARMUP_MS`,
+    `BINARY_STABLE_MS`, `BINARY_DEBOUNCE_MS`, `BINARY_BIAS_SETTLE_MS`) on
+    the module and the interface; tune them in `config.h`.
+35. **Removal:** pull the module out. The last level (or a floating one)
+    stays on screen; send `c`. That is expected.
+36. **Handoff:** repeat steps 4 and 8; DHT11 and passive results must be
     unchanged.
 
 **Never test shorts, reversed devices, powered circuits or charged
@@ -1621,6 +1920,19 @@ sources.
   `pullup-unverified`).
 - **A switch stays "OPEN" after you removed it:** expected. An open switch
   and an empty socket look the same, so send `c` to clear.
+- **Binary `err=follows-bias`:** that OUT floated or only followed a weak
+  pull (an empty node, a wrong mapping, or a released open collector
+  without a pull-up). Not evidence of a module.
+- **Binary `err=toggling` / `no-stable-level`:** the line changed too
+  often, or never held 200 ms, during that attempt: inconclusive. A noisy
+  supply, a module still warming up, or a live stimulus during the scan.
+- **`N possible pinouts` / `err=ambiguous-mappings`:** several mappings
+  showed the same kind of driven, stable level (often a wire or resistor
+  clamping a node). Serial lists them; pick with `n` and verify, or `c`.
+- **`LIVE UNVERIFIED`:** a tentative binary result. Run the guided
+  verification (`v`, `q`, `a`, `q`) before trusting the pinout.
+- **A binary module stays shown after removal:** expected; a static
+  output and a removed module look the same. Send `c`.
 
 ## Scope and safety limits
 
@@ -1644,6 +1956,9 @@ sources.
   never apply 5V to them.
 - "Ready" means the firmware is running. Detection is limited to:
   - DHT11-compatible sensors (powered probing);
+  - three-terminal digital-output modules compatible with the GPIO 3.3 V
+    profile, as tentative candidates, user-verified only by the guided
+    test with the real stimulus (powered probing);
   - responding I2C addresses and their mapping, with tentative hints,
     only with an eligible 3.3 V supply (not enabled as shipped);
   - HC-SR04-compatible ultrasonic modules, only with a protected

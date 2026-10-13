@@ -15,7 +15,9 @@
 // name:
 //   ThreeWirePowered + ProtectedActive + GpioLogic: engine drives GND LOW,
 //     VCC HIGH and pulls DATA up (behind the protected interface) before
-//     probe(); the fourth node stays plain INPUT.
+//     probe(); the fourth node stays plain INPUT. A driver whose DATA is the
+//     module's output (dataIsOutput) gets no engine pull-up; the node is
+//     shown as OUT and the driver chooses its input bias.
 //   FourWirePowered + ProtectedActive + Backend5V / Supply3V3: the
 //     protected four-wire backend (four_wire_backend.h) routes that supply
 //     and ground, only if it reports kBackendFourWireBaseline plus the
@@ -124,6 +126,18 @@ struct DriverRequirements {
   bool openDrainSignals;              // signal/DATA nodes are only released or sunk, never driven
                                       // HIGH (a push-pull signal is vetoed on any coupling)
   const char *signalLabel[2];         // FourWirePowered: display names of SIG1, SIG2 (<= 3 chars); else nullptr
+  bool dataIsOutput;                  // ThreeWirePowered: DATA is the module's output, only ever read
+                                      // (never sunk, no engine pull-up); shown as OUT
+};
+
+// How much a successful probe() says about the part. The engine stops
+// discovery only on Validated; a Candidate is kept tentative while every
+// other eligible attempt still runs, and is never shown as confirmed.
+enum class EvidenceLevel : uint8_t {
+  None,          // nothing since reset()
+  Candidate,     // plausible, not identifying (e.g. a driven, stable digital level)
+  Validated,     // a protocol response the driver checked (DHT frame, echoes, I2C ACKs)
+  UserVerified,  // a candidate the user confirmed with a guided test on this binding
 };
 
 // GPIO numbers for one attempt. Only the member matching `topology` is
@@ -204,4 +218,8 @@ class SensorDriver {
     (void)command;
     return false;
   }
+
+  // Evidence behind the latest successful probe() or readSample(); the
+  // engine reads it only after one. Protocol drivers are Validated.
+  virtual EvidenceLevel evidence() const { return EvidenceLevel::Validated; }
 };
